@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Odoo Time Tracker</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', system-ui, sans-serif; background: #0f0f1a; color: #e2e8f0; min-height: 100vh; }
+  input, select, textarea, button { font-family: inherit; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: #1a1a2e; }
+  ::-webkit-scrollbar-thumb { background: #4338ca; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+// ── All API calls go through localhost:3010 ──
+const BASE = "http://localhost:3010";
+
+async function odooRPC(method, args) {
+  const res = await fetch(`${BASE}/jsonrpc`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "call", params: { service: args[0], method: args[1], args: args[2] } })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.data?.message || data.error.message || "Odoo error");
+  return data.result;
+}
+
+async function keychainGet() {
+  const res = await fetch(`${BASE}/keychain/creds`);
+  return res.json();
+}
+async function keychainSave(creds, anthropicKey) {
+  await fetch(`${BASE}/keychain/creds`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ creds, anthropicKey })
+  });
+}
+async function keychainDelete() {
+  await fetch(`${BASE}/keychain/delete`, { method: "POST" });
+}
+
+// ── LocalStorage for timesheet history only ──
+const lsSave = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const lsLoad = (k) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } };
+
+const TABS = ["Log Time", "History", "Settings"];
+const COLORS = ["#6366f1","#8b5cf6","#ec4899","#f59e0b","#10b981","#3b82f6","#ef4444","#06b6d4"];
+
+function App() {
+  const [tab, setTab] = useState("Log Time");
+  const [creds, setCreds] = useState(null);          // null = not loaded yet
+  const [anthropicKey, setAnthropicKey] = useState("");
+  const [uid, setUid] = useState(null);
+  const [projects, setProjects] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [booting, setBooting] = useState(true);
+
+  // Log Time
+  const [aiInput, setAiInput] = useState("");
+  const [parsedEntries, setParsedEntries] = useState([]);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState("");
+  const [submitStatus, setSubmitStatus] = useState("");
+
+  // History
+  const [historyEntries, setHistoryEntries] = useState([]);
+  const [historyRange, setHistoryRange] = useState("week");
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  // Settings form
+  const [sf, setSf] = useState({ url: "", db: "", email: "", password: "", anthropicKey: "" });
+  const [settingsSaved, setSettingsSaved] = useState(false);
+  const [odooConnecting, setOdooConnecting] = useState(false);
+  const [odooStatus, setOdooStatus] = useState("");
+
+  // ── Load from keychain on mount ──
+  useEffect(() => {
+    (async () => {
+      try {
+        const { creds: c, anthropicKey: ak } = await keychainGet();
+        if (c) { setCreds(c); setSf(prev => ({ ...prev, ...c, anthropicKey: ak || "" })); }
+        if (ak) setAnthropicKey(ak);
+      } catch {}
+      setBooting(false);
+    })();
+  }, []);
+
+  // ── Auth when creds available ──
+  useEffect(() => {
+    if (creds?.url && creds?.db && creds?.email && creds?.password) doAuth();
+  }, [creds]);
+
+  async function doAuth() {
+    try {
+      const id = await odooRPC("call", ["common", "authenticate", [creds.db, creds.email, creds.password, {}]]);
+      if (id) { setUid(id); fetchData(id); } else setUid(null);
+    } catch { setUid(null); }
+  }
+
+  async function fetchData(id) {
+    try {
+      const projs = await odooRPC("call", ["object", "execute_kw", [creds.db, id, creds.password, "project.project", "search_read", [[["active","=",true]]], { fields: ["id","name"], limit: 100 }]]);
+      setProjects(projs || []);
+      const tsk = await odooRPC("call", ["object", "execute_kw", [creds.db, id, creds.password, "project.task", "search_read", [[["active","=",true]]], { fields: ["id","name","project_id"], limit: 300 }]]);
+      setTasks(tsk || []);
+    } catch {}
+  }
+
+  // ── AI Parse ──
+  async function handleAIParse() {
+    if (!aiInput.trim()) return;
+    if (!anthropicKey) { setAiError("Add your Anthropic API key in Settings."); return; }
+    setAiLoading(true); setAiError(""); setParsedEntries([]);
+    try {
+      const projectList = projects.map(p => `${p.id}: ${p.name}`).join("\n") || "No projects loaded";
+      const taskList = tasks.map(t => `${t.id}: ${t.name} (project: ${t.project_id?.[1] || "none"})`).join("\n") || "No tasks loaded";
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514", max_tokens: 1000,
+          messages: [{ role: "user", content:
+            `You are a timesheet assistant. Parse the work summary into time entries.\n\nAvailable Projects:\n${projectList}\n\nAvailable Tasks:\n${taskList}\n\nWork summary: "${aiInput}"\n\nToday: ${new Date().toISOString().split("T")[0]}\n\nRespond ONLY with a JSON array (no markdown):\n- date: YYYY-MM-DD\n- project_id: number or null\n- project_name: string\n- task_id: number or null\n- task_name: string\n- hours: number\n- description: string`
+          }]
+        })
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message);
+      const text = data.content?.map(b => b.text || "").join("") || "";
+      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      setParsedEntries(parsed.map((e, i) => ({ ...e, _id: i, _checked: true })));
+    } catch (e) { setAiError("Parse failed: " + e.message); }
+    setAiLoading(false);
+  }
+
+  const updateEntry = (i, f, v) => setParsedEntries(prev => prev.map((e, idx) => idx === i ? { ...e, [f]: v } : e));
+
+  async function submitEntries() {
+    const toSubmit = parsedEntries.filter(e => e._checked);
+    if (!toSubmit.length) return;
+    setSubmitStatus("submitting");
+    try {
+      let id = uid;
+      if (!id) {
+        id = await odooRPC("call", ["common", "authenticate", [creds.db, creds.email, creds.password, {}]]);
+        setUid(id);
+      }
+      for (const e of toSubmit) {
+        const vals = { name: e.description, unit_amount: e.hours, date: e.date, ...(e.project_id ? { project_id: e.project_id } : {}), ...(e.task_id ? { task_id: e.task_id } : {}) };
+        await odooRPC("call", ["object", "execute_kw", [creds.db, id, creds.password, "account.analytic.line", "create", [vals]]]);
+      }
+      const existing = lsLoad("timesheet_history") || [];
+      lsSave("timesheet_history", [...existing, ...toSubmit.map(e => ({ ...e, _logged: new Date().toISOString() }))]);
+      setSubmitStatus("success"); setParsedEntries([]); setAiInput("");
+      setTimeout(() => setSubmitStatus(""), 3000);
+    } catch (e) { setSubmitStatus("error: " + e.message); }
+  }
+
+  // ── History ──
+  async function loadHistory() {
+    setHistoryLoading(true);
+    try {
+      const now = new Date(), start = new Date(now);
+      if (historyRange === "day") start.setHours(0,0,0,0);
+      else if (historyRange === "week") start.setDate(now.getDate() - 7);
+      else if (historyRange === "month") start.setMonth(now.getMonth() - 1);
+      else start.setFullYear(now.getFullYear() - 1);
+      const dateStr = start.toISOString().split("T")[0];
+      if (uid && creds) {
+        const entries = await odooRPC("call", ["object", "execute_kw", [creds.db, uid, creds.password, "account.analytic.line", "search_read", [[["date",">=",dateStr],["user_id.login","=",creds.email]]], { fields: ["date","name","unit_amount","project_id","task_id"], limit: 500, order: "date desc" }]]);
+        setHistoryEntries(entries || []);
+      } else {
+        const local = lsLoad("timesheet_history") || [];
+        setHistoryEntries(local.filter(e => new Date(e.date) >= start));
+      }
+    } catch {
+      const local = lsLoad("timesheet_history") || [];
+      setHistoryEntries(local);
+    }
+    setHistoryLoading(false);
+  }
+
+  useEffect(() => { if (tab === "History") loadHistory(); }, [tab, historyRange, uid]);
+
+  // ── Settings ──
+  async function saveSettings() {
+    const c = { url: sf.url, db: sf.db, email: sf.email, password: sf.password };
+    await keychainSave(c, sf.anthropicKey);
+    setCreds(c); setAnthropicKey(sf.anthropicKey);
+    setSettingsSaved(true); setTimeout(() => setSettingsSaved(false), 2500);
+  }
+
+  async function clearCredentials() {
+    await keychainDelete();
+    setCreds(null); setAnthropicKey(""); setUid(null); setProjects([]); setTasks([]);
+    setSf({ url: "", db: "", email: "", password: "", anthropicKey: "" });
+  }
+
+  async function testConnection() {
+    setOdooConnecting(true); setOdooStatus("");
+    try {
+      // Temporarily save to keychain so proxy can use the URL
+      await keychainSave({ url: sf.url, db: sf.db, email: sf.email, password: sf.password }, sf.anthropicKey);
+      const id = await odooRPC("call", ["common", "authenticate", [sf.db, sf.email, sf.password, {}]]);
+      setOdooStatus(id ? `✅ Connected! User ID: ${id}` : "❌ Invalid credentials");
+    } catch (e) { setOdooStatus("❌ " + e.message); }
+    setOdooConnecting(false);
+  }
+
+  // ── Chart ──
+  const totalHours = historyEntries.reduce((s, e) => s + (e.unit_amount || e.hours || 0), 0);
+  const chartData = Object.entries(
+    historyEntries.reduce((acc, e) => { const d = e.date || "?"; acc[d] = (acc[d] || 0) + (e.unit_amount || e.hours || 0); return acc; }, {})
+  ).sort(([a],[b]) => a.localeCompare(b)).slice(-14);
+  const maxH = Math.max(...chartData.map(([,v]) => v), 1);
+  const hasCreds = uid !== null;
+
+  const inp = { width:"100%", background:"#0f0f1a", border:"1px solid #4338ca", borderRadius:8, padding:"9px 12px", color:"#e2e8f0", fontSize:13, outline:"none" };
+  const lbl = { fontSize:12, color:"#a5b4fc", display:"block", marginBottom:5, fontWeight:600 };
+
+  if (booting) return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", height:"100vh", color:"#818cf8", fontSize:14 }}>
+      🔐 Loading credentials from keychain…
+    </div>
+  );
+
+  return (
+    <div style={{ background:"#0f0f1a", minHeight:"100vh", color:"#e2e8f0" }}>
+      {/* Header */}
+      <div style={{ background:"linear-gradient(135deg,#1e1b4b,#312e81)", padding:"20px 24px", borderBottom:"1px solid #3730a3" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:16 }}>
+          <div style={{ width:36, height:36, borderRadius:10, background:"linear-gradient(135deg,#6366f1,#8b5cf6)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:18 }}>⏱</div>
+          <div>
+            <div style={{ fontWeight:700, fontSize:18, color:"#fff" }}>Odoo Time Tracker</div>
+            <div style={{ fontSize:12, color:"#a5b4fc" }}>AI-powered timesheet logging</div>
+          </div>
+          <div style={{ marginLeft:"auto", fontSize:12, padding:"4px 10px", borderRadius:20, background: hasCreds ? "#065f46" : "#7f1d1d", color: hasCreds ? "#6ee7b7" : "#fca5a5" }}>
+            {hasCreds ? "● Connected" : "● Not connected"}
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:4 }}>
+          {TABS.map(t => (
+            <button key={t} onClick={() => setTab(t)} style={{ padding:"7px 16px", borderRadius:8, border:"none", cursor:"pointer", fontSize:13, fontWeight:600, background: tab===t ? "#6366f1" : "transparent", color: tab===t ? "#fff" : "#a5b4fc" }}>{t}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ padding:24, maxWidth:860, margin:"0 auto" }}>
+
+        {/* ── LOG TIME ── */}
+        {tab === "Log Time" && (
+          <div>
+            {!hasCreds && (
+              <div style={{ background:"#451a03", border:"1px solid #92400e", borderRadius:12, padding:"12px 16px", marginBottom:20, fontSize:13, color:"#fcd34d" }}>
+                ⚠️ Not connected to Odoo. Go to <strong>Settings</strong> to sign in.
+              </div>
+            )}
+            {!anthropicKey && (
+              <div style={{ background:"#1e1a03", border:"1px solid #a16207", borderRadius:12, padding:"12px 16px", marginBottom:20, fontSize:13, color:"#fde68a" }}>
+                🤖 No Anthropic API key. Add it in <strong>Settings</strong> to enable AI parsing.
+              </div>
+            )}
+            <div style={{ background:"#1e1b4b", border:"1px solid #3730a3", borderRadius:16, padding:20, marginBottom:20 }}>
+              <div style={{ fontWeight:700, marginBottom:6, fontSize:15, color:"#c7d2fe" }}>🤖 What did you work on today?</div>
+              <div style={{ fontSize:12, color:"#818cf8", marginBottom:12 }}>Describe your day naturally — AI extracts time entries automatically.</div>
+              <textarea value={aiInput} onChange={e => setAiInput(e.target.value)}
+                placeholder="e.g. Spent 2.5 hours on the Acme website redesign fixing the header. After lunch ~45 mins reviewing pull requests for the API project. Then 1 hour client call for Project Phoenix."
+                style={{ width:"100%", minHeight:100, background:"#0f0f1a", border:"1px solid #4338ca", borderRadius:10, padding:12, color:"#e2e8f0", fontSize:13, resize:"vertical", outline:"none" }} />
+              <div style={{ display:"flex", gap:10, marginTop:12, alignItems:"center" }}>
+                <button onClick={handleAIParse} disabled={aiLoading || !aiInput.trim()} style={{ padding:"9px 20px", borderRadius:8, border:"none", cursor: aiLoading ? "wait" : "pointer", background:"linear-gradient(135deg,#6366f1,#8b5cf6)", color:"#fff", fontWeight:600, fontSize:13, opacity: aiLoading ? 0.7 : 1 }}>
+                  {aiLoading ? "⏳ Parsing..." : "✨ Parse with AI"}
+                </button>
+                {aiError && <span style={{ color:"#f87171", fontSize:12 }}>{aiError}</span>}
+              </div>
+            </div>
+
+            {parsedEntries.length > 0 && (
+              <div style={{ background:"#1a1a2e", border:"1px solid #312e81", borderRadius:16, padding:20, marginBottom:20 }}>
+                <div style={{ fontWeight:700, marginBottom:14, fontSize:15, color:"#c7d2fe", display:"flex", justifyContent:"space-between" }}>
+                  <span>📋 Review Entries ({parsedEntries.filter(e=>e._checked).length} selected)</span>
+                  <span style={{ fontSize:12, color:"#818cf8" }}>Total: {parsedEntries.filter(e=>e._checked).reduce((s,e)=>s+(+e.hours||0),0).toFixed(2)}h</span>
+                </div>
+                {parsedEntries.map((entry, i) => (
+                  <div key={i} style={{ background: entry._checked ? "#1e1b4b" : "#0f0f1a", border:`1px solid ${entry._checked ? "#4338ca" : "#1f2937"}`, borderRadius:12, padding:"14px 16px", marginBottom:10, opacity: entry._checked ? 1 : 0.5 }}>
+                    <div style={{ display:"flex", gap:12 }}>
+                      <input type="checkbox" checked={entry._checked} onChange={e => updateEntry(i,"_checked",e.target.checked)} style={{ marginTop:4, cursor:"pointer", width:16, height:16, accentColor:"#6366f1" }} />
+                      <div style={{ flex:1, display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+                        <div>
+                          <label style={{ fontSize:11, color:"#818cf8", display:"block", marginBottom:3 }}>DATE</label>
+                          <input type="date" value={entry.date} onChange={e => updateEntry(i,"date",e.target.value)} style={{ width:"100%", background:"#0f0f1a", border:"1px solid #374151", borderRadius:6, padding:"5px 8px", color:"#e2e8f0", fontSize:12 }} />
+                        </div>
+                        <div>
+                          <label style={{ fontSize:11, color:"#818cf8", display:"block", marginBottom:3 }}>HOURS</label>
+                          <input type="number" step="0.25" min="0" value={entry.hours} onChange={e => updateEntry(i,"hours",+e.target.value)} style={{ width:"100%", background:"#0f0f1a", border:"1px solid #374151", borderRadius:6, padding:"5px 8px", color:"#e2e8f0", fontSize:12 }} />
+                        </div>
+                        <div>
+                          <label style={{ fontSize:11, color:"#818cf8", display:"block", marginBottom:3 }}>PROJECT</label>
+                          <select value={entry.project_id || ""} onChange={e => { const p = projects.find(p => p.id == e.target.value); updateEntry(i,"project_id",p?.id||null); updateEntry(i,"project_name",p?.name||entry.project_name); }} style={{ width:"100%", background:"#0f0f1a", border:"1px solid #374151", borderRadius:6, padding:"5px 8px", color:"#e2e8f0", fontSize:12 }}>
+                            <option value="">{entry.project_name || "— select —"}</option>
+                            {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label style={{ fontSize:11, color:"#818cf8", display:"block", marginBottom:3 }}>TASK</label>
+                          <select value={entry.task_id || ""} onChange={e => { const t = tasks.find(t => t.id == e.target.value); updateEntry(i,"task_id",t?.id||null); updateEntry(i,"task_name",t?.name||entry.task_name); }} style={{ width:"100%", background:"#0f0f1a", border:"1px solid #374151", borderRadius:6, padding:"5px 8px", color:"#e2e8f0", fontSize:12 }}>
+                            <option value="">{entry.task_name || "— select —"}</option>
+                            {tasks.filter(t => !entry.project_id || t.project_id?.[0] == entry.project_id).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                          </select>
+                        </div>
+                        <div style={{ gridColumn:"1/-1" }}>
+                          <label style={{ fontSize:11, color:"#818cf8", display:"block", marginBottom:3 }}>DESCRIPTION</label>
+                          <input value={entry.description} onChange={e => updateEntry(i,"description",e.target.value)} style={{ width:"100%", background:"#0f0f1a", border:"1px solid #374151", borderRadius:6, padding:"5px 8px", color:"#e2e8f0", fontSize:12 }} />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                <button onClick={submitEntries} disabled={!parsedEntries.some(e=>e._checked)} style={{ padding:"10px 24px", borderRadius:8, border:"none", cursor:"pointer", background:"linear-gradient(135deg,#059669,#10b981)", color:"#fff", fontWeight:700, fontSize:14, marginTop:4 }}>
+                  {hasCreds ? "🚀 Submit to Odoo" : "💾 Save Locally"}
+                </button>
+                {submitStatus === "submitting" && <span style={{ marginLeft:12, color:"#fbbf24", fontSize:13 }}>⏳ Submitting…</span>}
+                {submitStatus === "success" && <span style={{ marginLeft:12, color:"#34d399", fontSize:13 }}>✅ Logged successfully!</span>}
+                {submitStatus.startsWith("error") && <span style={{ marginLeft:12, color:"#f87171", fontSize:12 }}>{submitStatus}</span>}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── HISTORY ── */}
+        {tab === "History" && (
+          <div>
+            <div style={{ display:"flex", gap:8, marginBottom:20, flexWrap:"wrap" }}>
+              {["day","week","month","year"].map(r => (
+                <button key={r} onClick={() => setHistoryRange(r)} style={{ padding:"7px 16px", borderRadius:8, border:"none", cursor:"pointer", background: historyRange===r ? "#6366f1" : "#1e1b4b", color: historyRange===r ? "#fff" : "#a5b4fc", fontWeight:600, fontSize:13, textTransform:"capitalize" }}>
+                  {r === "day" ? "Today" : `This ${r}`}
+                </button>
+              ))}
+              <button onClick={loadHistory} style={{ marginLeft:"auto", padding:"7px 14px", borderRadius:8, border:"1px solid #3730a3", background:"transparent", color:"#818cf8", cursor:"pointer", fontSize:13 }}>↻ Refresh</button>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12, marginBottom:20 }}>
+              {[{label:"Total Hours",value:totalHours.toFixed(2)+"h",icon:"⏰"},{label:"Entries",value:historyEntries.length,icon:"📝"},{label:"Avg/Day",value:chartData.length?(totalHours/chartData.length).toFixed(1)+"h":"—",icon:"📊"}].map(c => (
+                <div key={c.label} style={{ background:"#1e1b4b", border:"1px solid #3730a3", borderRadius:12, padding:"16px 20px" }}>
+                  <div style={{ fontSize:22, marginBottom:4 }}>{c.icon}</div>
+                  <div style={{ fontSize:22, fontWeight:700, color:"#fff" }}>{c.value}</div>
+                  <div style={{ fontSize:12, color:"#818cf8" }}>{c.label}</div>
+                </div>
+              ))}
+            </div>
+            {chartData.length > 0 && (
+              <div style={{ background:"#1e1b4b", border:"1px solid #3730a3", borderRadius:16, padding:20, marginBottom:20 }}>
+                <div style={{ fontWeight:600, color:"#c7d2fe", marginBottom:16, fontSize:14 }}>Hours per Day</div>
+                <div style={{ display:"flex", alignItems:"flex-end", gap:6, height:120 }}>
+                  {chartData.map(([date, hours], i) => (
+                    <div key={date} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
+                      <div style={{ fontSize:9, color:"#818cf8" }}>{hours.toFixed(1)}</div>
+                      <div style={{ width:"100%", height:`${(hours/maxH)*90}px`, background:COLORS[i%COLORS.length], borderRadius:"4px 4px 0 0", minHeight:3 }} />
+                      <div style={{ fontSize:9, color:"#6b7280", transform:"rotate(-45deg)", transformOrigin:"center", whiteSpace:"nowrap" }}>{date.slice(5)}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {historyLoading ? (
+              <div style={{ color:"#818cf8", textAlign:"center", padding:40 }}>⏳ Loading…</div>
+            ) : historyEntries.length === 0 ? (
+              <div style={{ color:"#6b7280", textAlign:"center", padding:40 }}>No entries found for this period.</div>
+            ) : (
+              <div style={{ background:"#1a1a2e", border:"1px solid #312e81", borderRadius:16, padding:16 }}>
+                <div style={{ fontWeight:700, color:"#c7d2fe", marginBottom:12, fontSize:14 }}>Timesheet Entries</div>
+                {historyEntries.map((e, i) => (
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom: i<historyEntries.length-1 ? "1px solid #1f2937" : "none" }}>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontSize:13, color:"#e2e8f0", fontWeight:500 }}>{e.name || e.description || "—"}</div>
+                      <div style={{ fontSize:11, color:"#818cf8", marginTop:2 }}>{e.project_id?.[1] || e.project_name || "No project"}{(e.task_id?.[1]||e.task_name) ? ` · ${e.task_id?.[1]||e.task_name}` : ""}</div>
+                    </div>
+                    <div style={{ textAlign:"right" }}>
+                      <div style={{ fontSize:14, fontWeight:700, color:"#a5b4fc" }}>{(e.unit_amount||e.hours||0).toFixed(2)}h</div>
+                      <div style={{ fontSize:11, color:"#6b7280" }}>{e.date}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── SETTINGS ── */}
+        {tab === "Settings" && (
+          <div>
+            <div style={{ background:"#1e1b4b", border:"1px solid #3730a3", borderRadius:16, padding:24, marginBottom:16 }}>
+              <div style={{ fontWeight:700, fontSize:15, color:"#c7d2fe", marginBottom:4 }}>🔐 Odoo Login</div>
+              <div style={{ fontSize:12, color:"#818cf8", marginBottom:20 }}>
+                Credentials are stored securely in your <strong style={{color:"#a5b4fc"}}>system keychain</strong> (Keychain on macOS, Credential Manager on Windows, libsecret on Linux).
+              </div>
+              {[
+                {key:"url", label:"Odoo URL", placeholder:"https://your-instance.odoo.com", type:"url"},
+                {key:"db", label:"Database Name", placeholder:"your_database_name", type:"text"},
+                {key:"email", label:"Email", placeholder:"you@company.com", type:"email"},
+                {key:"password", label:"Password", placeholder:"••••••••••", type:"password"},
+              ].map(f => (
+                <div key={f.key} style={{ marginBottom:16 }}>
+                  <label style={lbl}>{f.label}</label>
+                  <input type={f.type} value={sf[f.key]} onChange={e => setSf(p=>({...p,[f.key]:e.target.value}))} placeholder={f.placeholder} style={inp} />
+                </div>
+              ))}
+              <hr style={{ border:"none", borderTop:"1px solid #312e81", margin:"20px 0" }} />
+              <div style={{ fontWeight:700, fontSize:14, color:"#c7d2fe", marginBottom:4 }}>🤖 Anthropic API Key</div>
+              <div style={{ fontSize:12, color:"#818cf8", marginBottom:12 }}>
+                Required for AI parsing. Get yours at <a href="https://console.anthropic.com" target="_blank" style={{color:"#818cf8"}}>console.anthropic.com</a>. Also stored in keychain.
+              </div>
+              <div style={{ marginBottom:20 }}>
+                <label style={lbl}>API Key</label>
+                <input type="password" value={sf.anthropicKey} onChange={e => setSf(p=>({...p,anthropicKey:e.target.value}))} placeholder="sk-ant-..." style={inp} />
+              </div>
+              <div style={{ display:"flex", gap:10, flexWrap:"wrap", alignItems:"center" }}>
+                <button onClick={testConnection} disabled={odooConnecting} style={{ padding:"9px 18px", borderRadius:8, border:"1px solid #4338ca", background:"transparent", color:"#a5b4fc", cursor:"pointer", fontSize:13, fontWeight:600 }}>
+                  {odooConnecting ? "Testing…" : "🔌 Test Connection"}
+                </button>
+                <button onClick={saveSettings} style={{ padding:"9px 18px", borderRadius:8, border:"none", background:"linear-gradient(135deg,#6366f1,#8b5cf6)", color:"#fff", cursor:"pointer", fontSize:13, fontWeight:700 }}>
+                  💾 Save to Keychain
+                </button>
+                <button onClick={clearCredentials} style={{ padding:"9px 18px", borderRadius:8, border:"1px solid #7f1d1d", background:"transparent", color:"#f87171", cursor:"pointer", fontSize:13 }}>
+                  🗑 Clear Keychain
+                </button>
+                {settingsSaved && <span style={{ color:"#34d399", fontSize:13 }}>✅ Saved to keychain!</span>}
+              </div>
+              {odooStatus && <div style={{ marginTop:12, fontSize:13, padding:"8px 12px", borderRadius:8, background:"#0f0f1a", border:"1px solid #374151" }}>{odooStatus}</div>}
+            </div>
+            <div style={{ background:"#1a1a2e", border:"1px solid #312e81", borderRadius:12, padding:16, fontSize:12, color:"#6b7280" }}>
+              <strong style={{ color:"#818cf8" }}>📖 Tips</strong><br /><br />
+              • Your DB name is usually your subdomain — e.g. <span style={{color:"#a5b4fc"}}>mycompany</span> for mycompany.odoo.com<br />
+              • Visit <span style={{color:"#a5b4fc"}}>[your-odoo-url]/web/database/selector</span> to confirm your DB name<br />
+              • Make sure your Odoo user has <strong style={{color:"#a5b4fc"}}>Timesheets</strong> access<br />
+              • To start the app: <span style={{color:"#a5b4fc"}}>node server.js</span> then open <span style={{color:"#a5b4fc"}}>http://localhost:3010</span>
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
