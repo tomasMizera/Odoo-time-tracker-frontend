@@ -130,7 +130,12 @@ server.listen(PORT, () => {
   console.log(`  ✅  Running at http://localhost:${PORT}`);
   console.log("  🔐  Credentials stored in system keychain");
   console.log("");
-  console.log("  Open http://localhost:3010 in your browser");
   console.log("  Press Ctrl+C to stop");
   console.log("");
+
+  const url = `http://localhost:${PORT}`;
+  const cmd = process.platform === "win32" ? `start "" "${url}"`
+    : process.platform === "darwin" ? `open "${url}"`
+    : `xdg-open "${url}"`;
+  require("child_process").exec(cmd);
 });
