@@ -24,6 +24,7 @@ const PORT    = 3010;
 const SERVICE = "odoo-time-tracker";
 const ODOO_KEY  = "odoo_creds";     // stores JSON: { url, db, email, password }
 const ANTH_KEY  = "anthropic_key";  // stores raw API key string
+const CTX_KEY   = "user_context";   // stores freeform user context string
 
 // ── Read the HTML file (same directory as this script) ──
 const HTML_PATH = path.join(__dirname, "odoo-tracker.html");
@@ -69,8 +70,9 @@ const server = http.createServer(async (req, res) => {
   if (method === "GET" && url === "/keychain/creds") {
     const raw = await keytar.getPassword(SERVICE, ODOO_KEY);
     const ak  = await keytar.getPassword(SERVICE, ANTH_KEY);
+    const ctx = await keytar.getPassword(SERVICE, CTX_KEY);
     const creds = raw ? JSON.parse(raw) : null;
-    json(res, 200, { creds, anthropicKey: ak || "" });
+    json(res, 200, { creds, anthropicKey: ak || "", userContext: ctx || "" });
     return;
   }
 
@@ -81,6 +83,9 @@ const server = http.createServer(async (req, res) => {
     if (body.anthropicKey !== undefined) {
       await keytar.setPassword(SERVICE, ANTH_KEY, body.anthropicKey);
     }
+    if (body.userContext !== undefined) {
+      await keytar.setPassword(SERVICE, CTX_KEY, body.userContext);
+    }
     json(res, 200, { ok: true });
     return;
   }
@@ -89,6 +94,7 @@ const server = http.createServer(async (req, res) => {
   if (method === "POST" && url === "/keychain/delete") {
     await keytar.deletePassword(SERVICE, ODOO_KEY);
     await keytar.deletePassword(SERVICE, ANTH_KEY);
+    await keytar.deletePassword(SERVICE, CTX_KEY);
     json(res, 200, { ok: true });
     return;
   }

@@ -39,11 +39,11 @@ async function keychainGet() {
   const res = await fetch(`${BASE}/keychain/creds`);
   return res.json();
 }
-async function keychainSave(creds, anthropicKey) {
+async function keychainSave(creds, anthropicKey, userContext) {
   await fetch(`${BASE}/keychain/creds`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ creds, anthropicKey })
+    body: JSON.stringify({ creds, anthropicKey, userContext })
   });
 }
 async function keychainDelete() {
@@ -54,8 +54,40 @@ async function keychainDelete() {
 const lsSave = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 const lsLoad = (k) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } };
 
-const TABS = ["Log Time", "History", "Settings"];
+const TABS = ["Log Time", "Settings"];
 const COLORS = ["#6366f1","#8b5cf6","#ec4899","#f59e0b","#10b981","#3b82f6","#ef4444","#06b6d4"];
+
+function projectColor(name) {
+  if (!name) return "#6b7280";
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) & 0xffffffff;
+  return COLORS[Math.abs(h) % COLORS.length];
+}
+
+function fmtDate(d) {
+  const [y,m,day] = d.split("-");
+  return `${day}/${m}/${y}`;
+}
+
+function todayISO() { return new Date().toISOString().split("T")[0]; }
+
+function weekStartOf(dateStr) {
+  const d = new Date(dateStr);
+  const day = d.getDay();
+  d.setDate(d.getDate() - (day === 0 ? 6 : day - 1)); // Monday
+  return d.toISOString().split("T")[0];
+}
+
+function weekDaysOf(dateStr) {
+  const start = new Date(weekStartOf(dateStr));
+  return Array.from({length:7}, (_,i) => {
+    const d = new Date(start);
+    d.setDate(start.getDate() + i);
+    return d.toISOString().split("T")[0];
+  });
+}
+
+const DAY_NAMES = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 
 function App() {
   const [tab, setTab] = useState("Log Time");
@@ -65,6 +97,7 @@ function App() {
   const [projects, setProjects] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [booting, setBooting] = useState(true);
+  const [userContext, setUserContext] = useState("");
 
   // Log Time
   const [aiInput, setAiInput] = useState("");
@@ -73,13 +106,39 @@ function App() {
   const [aiError, setAiError] = useState("");
   const [submitStatus, setSubmitStatus] = useState("");
 
+  // Quick-add row (last line of table) — persists last project/task
+  const [quickEntry, setQuickEntry] = useState(() => {
+    const last = lsLoad("last_entry") || {};
+    return { project_id: last.project_id||null, project_name: last.project_name||"", task_id: last.task_id||null, task_name: last.task_name||"", description: "", hours: "" };
+  });
+  const [quickStatus, setQuickStatus] = useState("");
+
+  // Table editing (day view)
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState({});
+  const [editStatus, setEditStatus] = useState("");
+
+  // Week view cell editing
+  const [cellEditKey, setCellEditKey] = useState(null); // "rowKey|date"
+  const [cellEditVal, setCellEditVal] = useState("");
+  const [descPopup, setDescPopup] = useState(null); // { row, day, entry, hours, desc }
+  const [rowTooltip, setRowTooltip] = useState(null);
+
+  // Log Time – table
+  const [tableView, setTableView] = useState("day"); // "day" | "week"
+  const [tableDate, setTableDate] = useState(todayISO());
+  const [tableEntries, setTableEntries] = useState([]);
+  const [tableLoading, setTableLoading] = useState(false);
+  const [weekEntries, setWeekEntries] = useState([]);
+  const [weekLoading, setWeekLoading] = useState(false);
+
   // History
   const [historyEntries, setHistoryEntries] = useState([]);
   const [historyRange, setHistoryRange] = useState("week");
   const [historyLoading, setHistoryLoading] = useState(false);
 
   // Settings form
-  const [sf, setSf] = useState({ url: "", db: "", email: "", password: "", anthropicKey: "" });
+  const [sf, setSf] = useState({ url: "", db: "", email: "", password: "", anthropicKey: "", userContext: "" });
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [odooConnecting, setOdooConnecting] = useState(false);
   const [odooStatus, setOdooStatus] = useState("");
@@ -88,9 +147,10 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        const { creds: c, anthropicKey: ak } = await keychainGet();
-        if (c) { setCreds(c); setSf(prev => ({ ...prev, ...c, anthropicKey: ak || "" })); }
+        const { creds: c, anthropicKey: ak, userContext: uc } = await keychainGet();
+        if (c) { setCreds(c); setSf(prev => ({ ...prev, ...c, anthropicKey: ak || "", userContext: uc || "" })); }
         if (ak) setAnthropicKey(ak);
+        if (uc) setUserContext(uc);
       } catch {}
       setBooting(false);
     })();
@@ -110,9 +170,9 @@ function App() {
 
   async function fetchData(id) {
     try {
-      const projs = await odooRPC("call", ["object", "execute_kw", [creds.db, id, creds.password, "project.project", "search_read", [[["active","=",true]]], { fields: ["id","name"], limit: 100 }]]);
+      const projs = await odooRPC("call", ["object", "execute_kw", [creds.db, id, creds.password, "project.project", "search_read", [[["active","=",true]]], { fields: ["id","name"], limit: 200 }]]);
       setProjects(projs || []);
-      const tsk = await odooRPC("call", ["object", "execute_kw", [creds.db, id, creds.password, "project.task", "search_read", [[["active","=",true]]], { fields: ["id","name","project_id"], limit: 300 }]]);
+      const tsk = await odooRPC("call", ["object", "execute_kw", [creds.db, id, creds.password, "project.task", "search_read", [[["active","=",true]]], { fields: ["id","name","project_id"], limit: 500 }]]);
       setTasks(tsk || []);
     } catch {}
   }
@@ -125,17 +185,24 @@ function App() {
     try {
       const projectList = projects.map(p => `${p.id}: ${p.name}`).join("\n") || "No projects loaded";
       const taskList = tasks.map(t => `${t.id}: ${t.name} (project: ${t.project_id?.[1] || "none"})`).join("\n") || "No tasks loaded";
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514", max_tokens: 1000,
-          messages: [{ role: "user", content:
-            `You are a timesheet assistant. Parse the work summary into time entries.\n\nAvailable Projects:\n${projectList}\n\nAvailable Tasks:\n${taskList}\n\nWork summary: "${aiInput}"\n\nToday: ${new Date().toISOString().split("T")[0]}\n\nRespond ONLY with a JSON array (no markdown):\n- date: YYYY-MM-DD\n- project_id: number or null\n- project_name: string\n- task_id: number or null\n- task_name: string\n- hours: number\n- description: string`
-          }]
-        })
+      const body = JSON.stringify({
+        model: "claude-sonnet-4-20250514", max_tokens: 1000,
+        messages: [{ role: "user", content:
+          `You are a timesheet assistant. Parse the work summary into time entries.\n\nAvailable Projects:\n${projectList}\n\nAvailable Tasks:\n${taskList}\n\n${userContext ? `User context (use this to map shorthand names/codes to the correct projects and tasks):\n${userContext}\n\n` : ""}Work summary: "${aiInput}"\n\nToday: ${new Date().toISOString().split("T")[0]}\n\nRespond ONLY with a JSON array (no markdown):\n- date: YYYY-MM-DD\n- project_id: number or null\n- project_name: string\n- task_id: number or null\n- task_name: string\n- hours: number\n- description: string`
+        }]
       });
-      const data = await res.json();
+      const headers = { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" };
+      let data, attempts = 0;
+      while (true) {
+        const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body });
+        data = await res.json();
+        if (res.status === 529 || data.error?.type === "overloaded_error") {
+          if (++attempts >= 3) throw new Error("API overloaded — please try again in a moment");
+          await new Promise(r => setTimeout(r, attempts * 2000));
+          continue;
+        }
+        break;
+      }
       if (data.error) throw new Error(data.error.message);
       const text = data.content?.map(b => b.text || "").join("") || "";
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
@@ -163,9 +230,159 @@ function App() {
       const existing = lsLoad("timesheet_history") || [];
       lsSave("timesheet_history", [...existing, ...toSubmit.map(e => ({ ...e, _logged: new Date().toISOString() }))]);
       setSubmitStatus("success"); setParsedEntries([]); setAiInput("");
+      refreshCurrentView();
       setTimeout(() => setSubmitStatus(""), 3000);
     } catch (e) { setSubmitStatus("error: " + e.message); }
   }
+
+  // ── Quick-add entry (table last row) ──
+  async function submitQuickEntry(date) {
+    if (!quickEntry.hours || +quickEntry.hours <= 0) return;
+    if (!quickEntry.description.trim()) return;
+    setQuickStatus("submitting");
+    try {
+      const vals = { name: quickEntry.description, unit_amount: +quickEntry.hours, date: date || tableDate, ...(quickEntry.project_id ? { project_id: quickEntry.project_id } : {}), ...(quickEntry.task_id ? { task_id: quickEntry.task_id } : {}) };
+      if (uid && creds) await odooRPC("call", ["object", "execute_kw", [creds.db, uid, creds.password, "account.analytic.line", "create", [vals]]]);
+      const existing = lsLoad("timesheet_history") || [];
+      lsSave("timesheet_history", [...existing, { ...vals, _logged: new Date().toISOString() }]);
+      lsSave("last_entry", { project_id: quickEntry.project_id, project_name: quickEntry.project_name, task_id: quickEntry.task_id, task_name: quickEntry.task_name });
+      setQuickEntry(prev => ({ ...prev, description: "", hours: "" }));
+      setQuickStatus("ok");
+      setTimeout(() => setQuickStatus(""), 1500);
+      refreshCurrentView();
+    } catch (e) { setQuickStatus("error: " + e.message); }
+  }
+
+  // ── Edit / delete table entries ──
+  async function saveEdit() {
+    setEditStatus("saving");
+    try {
+      if (uid && creds && editingId) {
+        const vals = { name: editForm.description, unit_amount: +editForm.hours, date: editForm.date, ...(editForm.project_id ? { project_id: editForm.project_id } : {}), ...(editForm.task_id ? { task_id: editForm.task_id } : {}) };
+        await odooRPC("call", ["object", "execute_kw", [creds.db, uid, creds.password, "account.analytic.line", "write", [[editingId], vals]]]);
+      }
+      setEditingId(null); setEditForm({});
+      setEditStatus("");
+      refreshCurrentView();
+    } catch (e) { setEditStatus("error: " + e.message); }
+  }
+
+  async function deleteEntry(entryId) {
+    if (!window.confirm("Delete this time entry?")) return;
+    try {
+      if (uid && creds && entryId) {
+        await odooRPC("call", ["object", "execute_kw", [creds.db, uid, creds.password, "account.analytic.line", "unlink", [[entryId]]]]);
+      }
+      if (editingId === entryId) { setEditingId(null); setEditForm({}); }
+      refreshCurrentView();
+    } catch (e) { alert("Delete failed: " + e.message); }
+  }
+
+  async function saveCellEdit(row, date, existingEntry) {
+    const hours = parseFloat(cellEditVal);
+    const isNewRow = row === "__new__";
+    const rowData = isNewRow ? quickEntry : row;
+    setCellEditKey(null); setCellEditVal("");
+    if (isNaN(hours) || hours < 0) { if (!isNewRow) loadWeekEntries(tableDate); return; }
+    if (isNewRow && hours > 0) {
+      if (!quickEntry.description.trim()) { loadWeekEntries(tableDate); return; }
+      lsSave("last_entry", { project_id: quickEntry.project_id, project_name: quickEntry.project_name, task_id: quickEntry.task_id, task_name: quickEntry.task_name });
+      setQuickEntry(prev => ({ ...prev, description: "", hours: "" }));
+    }
+    try {
+      if (existingEntry) {
+        if (hours === 0) {
+          if (uid && creds) await odooRPC("call", ["object", "execute_kw", [creds.db, uid, creds.password, "account.analytic.line", "unlink", [[existingEntry.id]]]]);
+        } else {
+          if (uid && creds) await odooRPC("call", ["object", "execute_kw", [creds.db, uid, creds.password, "account.analytic.line", "write", [[existingEntry.id], { unit_amount: hours }]]]);
+        }
+      } else if (hours > 0) {
+        const vals = { name: rowData.description, unit_amount: hours, date, ...(rowData.project_id ? { project_id: rowData.project_id } : {}), ...(rowData.task_id ? { task_id: rowData.task_id } : {}) };
+        if (uid && creds) await odooRPC("call", ["object", "execute_kw", [creds.db, uid, creds.password, "account.analytic.line", "create", [vals]]]);
+      }
+      loadWeekEntries(tableDate);
+    } catch (e) { alert("Save failed: " + e.message); loadWeekEntries(tableDate); }
+  }
+
+  async function saveDescPopup() {
+    if (!descPopup) return;
+    const { row, day, entries } = descPopup;
+    setDescPopup(null);
+    try {
+      for (const ent of entries) {
+        const hours = parseFloat(ent.hours);
+        if (ent.id) {
+          if (!isNaN(hours) && hours === 0) {
+            if (uid && creds) await odooRPC("call", ["object", "execute_kw", [creds.db, uid, creds.password, "account.analytic.line", "unlink", [[ent.id]]]]);
+          } else if (!isNaN(hours) && hours > 0) {
+            if (uid && creds) await odooRPC("call", ["object", "execute_kw", [creds.db, uid, creds.password, "account.analytic.line", "write", [[ent.id], { unit_amount: hours, name: ent.desc }]]]);
+          }
+        } else if (!isNaN(hours) && hours > 0) {
+          const vals = { name: ent.desc, unit_amount: hours, date: day, ...(row.project_id ? { project_id: row.project_id } : {}), ...(row.task_id ? { task_id: row.task_id } : {}) };
+          if (uid && creds) await odooRPC("call", ["object", "execute_kw", [creds.db, uid, creds.password, "account.analytic.line", "create", [vals]]]);
+        }
+      }
+      loadWeekEntries(tableDate);
+    } catch (e) { alert("Save failed: " + e.message); loadWeekEntries(tableDate); }
+  }
+
+  function refreshCurrentView() {
+    if (tableView === "week") loadWeekEntries(tableDate);
+    else loadTableEntries(tableDate);
+  }
+
+  // ── Daily table ──
+  async function loadTableEntries(date) {
+    setTableLoading(true);
+    try {
+      if (uid && creds) {
+        const entries = await odooRPC("call", ["object", "execute_kw", [
+          creds.db, uid, creds.password,
+          "account.analytic.line", "search_read",
+          [[["date","=",date],["user_id.login","=",creds.email]]],
+          { fields: ["date","name","unit_amount","project_id","task_id"], order: "id asc" }
+        ]]);
+        setTableEntries(entries || []);
+      } else {
+        const local = lsLoad("timesheet_history") || [];
+        setTableEntries(local.filter(e => (e.date || "").startsWith(date)));
+      }
+    } catch {
+      const local = lsLoad("timesheet_history") || [];
+      setTableEntries(local.filter(e => (e.date || "").startsWith(date)));
+    }
+    setTableLoading(false);
+  }
+
+  async function loadWeekEntries(date) {
+    setWeekLoading(true);
+    const days = weekDaysOf(date);
+    const start = days[0], end = days[6];
+    try {
+      if (uid && creds) {
+        const entries = await odooRPC("call", ["object", "execute_kw", [
+          creds.db, uid, creds.password,
+          "account.analytic.line", "search_read",
+          [[["date",">=",start],["date","<=",end],["user_id.login","=",creds.email]]],
+          { fields: ["date","name","unit_amount","project_id","task_id"], order: "date asc, id asc" }
+        ]]);
+        setWeekEntries(entries || []);
+      } else {
+        const local = lsLoad("timesheet_history") || [];
+        setWeekEntries(local.filter(e => e.date >= start && e.date <= end));
+      }
+    } catch {
+      const local = lsLoad("timesheet_history") || [];
+      setWeekEntries(local.filter(e => e.date >= start && e.date <= end));
+    }
+    setWeekLoading(false);
+  }
+
+  useEffect(() => {
+    if (tab !== "Log Time") return;
+    if (tableView === "week") loadWeekEntries(tableDate);
+    else loadTableEntries(tableDate);
+  }, [tab, tableView, tableDate, uid]);
 
   // ── History ──
   async function loadHistory() {
@@ -196,15 +413,15 @@ function App() {
   // ── Settings ──
   async function saveSettings() {
     const c = { url: sf.url, db: sf.db, email: sf.email, password: sf.password };
-    await keychainSave(c, sf.anthropicKey);
-    setCreds(c); setAnthropicKey(sf.anthropicKey);
+    await keychainSave(c, sf.anthropicKey, sf.userContext);
+    setCreds(c); setAnthropicKey(sf.anthropicKey); setUserContext(sf.userContext);
     setSettingsSaved(true); setTimeout(() => setSettingsSaved(false), 2500);
   }
 
   async function clearCredentials() {
     await keychainDelete();
-    setCreds(null); setAnthropicKey(""); setUid(null); setProjects([]); setTasks([]);
-    setSf({ url: "", db: "", email: "", password: "", anthropicKey: "" });
+    setCreds(null); setAnthropicKey(""); setUid(null); setProjects([]); setTasks([]); setUserContext("");
+    setSf({ url: "", db: "", email: "", password: "", anthropicKey: "", userContext: "" });
   }
 
   async function testConnection() {
@@ -249,6 +466,14 @@ function App() {
             {hasCreds ? "● Connected" : "● Not connected"}
           </div>
         </div>
+        {hasCreds && creds && (
+          <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:12, fontSize:12, color:"#818cf8" }}>
+            <span style={{ color:"#6366f1" }}>●</span>
+            <span>Authenticated as <strong style={{ color:"#c7d2fe" }}>{creds.email}</strong></span>
+            <span style={{ color:"#3730a3" }}>·</span>
+            <span>on <strong style={{ color:"#c7d2fe", fontFamily:"monospace" }}>{creds.url}</strong></span>
+          </div>
+        )}
         <div style={{ display:"flex", gap:4 }}>
           {TABS.map(t => (
             <button key={t} onClick={() => setTab(t)} style={{ padding:"7px 16px", borderRadius:8, border:"none", cursor:"pointer", fontSize:13, fontWeight:600, background: tab===t ? "#6366f1" : "transparent", color: tab===t ? "#fff" : "#a5b4fc" }}>{t}</button>
@@ -272,14 +497,14 @@ function App() {
               </div>
             )}
             <div style={{ background:"#1e1b4b", border:"1px solid #3730a3", borderRadius:16, padding:20, marginBottom:20 }}>
-              <div style={{ fontWeight:700, marginBottom:6, fontSize:15, color:"#c7d2fe" }}>🤖 What did you work on today?</div>
               <div style={{ fontSize:12, color:"#818cf8", marginBottom:12 }}>Describe your day naturally — AI extracts time entries automatically.</div>
               <textarea value={aiInput} onChange={e => setAiInput(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter" && e.metaKey) handleAIParse(); }}
                 placeholder="e.g. Spent 2.5 hours on the Acme website redesign fixing the header. After lunch ~45 mins reviewing pull requests for the API project. Then 1 hour client call for Project Phoenix."
                 style={{ width:"100%", minHeight:100, background:"#0f0f1a", border:"1px solid #4338ca", borderRadius:10, padding:12, color:"#e2e8f0", fontSize:13, resize:"vertical", outline:"none" }} />
               <div style={{ display:"flex", gap:10, marginTop:12, alignItems:"center" }}>
                 <button onClick={handleAIParse} disabled={aiLoading || !aiInput.trim()} style={{ padding:"9px 20px", borderRadius:8, border:"none", cursor: aiLoading ? "wait" : "pointer", background:"linear-gradient(135deg,#6366f1,#8b5cf6)", color:"#fff", fontWeight:600, fontSize:13, opacity: aiLoading ? 0.7 : 1 }}>
-                  {aiLoading ? "⏳ Parsing..." : "✨ Parse with AI"}
+                  {aiLoading ? "⏳ Parsing..." : "✨ Parse with AI"}{!aiLoading && <span style={{ marginLeft:8, fontSize:11, opacity:0.6, fontWeight:400 }}>⌘↵</span>}
                 </button>
                 {aiError && <span style={{ color:"#f87171", fontSize:12 }}>{aiError}</span>}
               </div>
@@ -334,64 +559,287 @@ function App() {
                 {submitStatus.startsWith("error") && <span style={{ marginLeft:12, color:"#f87171", fontSize:12 }}>{submitStatus}</span>}
               </div>
             )}
-          </div>
-        )}
 
-        {/* ── HISTORY ── */}
-        {tab === "History" && (
-          <div>
-            <div style={{ display:"flex", gap:8, marginBottom:20, flexWrap:"wrap" }}>
-              {["day","week","month","year"].map(r => (
-                <button key={r} onClick={() => setHistoryRange(r)} style={{ padding:"7px 16px", borderRadius:8, border:"none", cursor:"pointer", background: historyRange===r ? "#6366f1" : "#1e1b4b", color: historyRange===r ? "#fff" : "#a5b4fc", fontWeight:600, fontSize:13, textTransform:"capitalize" }}>
-                  {r === "day" ? "Today" : `This ${r}`}
-                </button>
-              ))}
-              <button onClick={loadHistory} style={{ marginLeft:"auto", padding:"7px 14px", borderRadius:8, border:"1px solid #3730a3", background:"transparent", color:"#818cf8", cursor:"pointer", fontSize:13 }}>↻ Refresh</button>
-            </div>
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12, marginBottom:20 }}>
-              {[{label:"Total Hours",value:totalHours.toFixed(2)+"h",icon:"⏰"},{label:"Entries",value:historyEntries.length,icon:"📝"},{label:"Avg/Day",value:chartData.length?(totalHours/chartData.length).toFixed(1)+"h":"—",icon:"📊"}].map(c => (
-                <div key={c.label} style={{ background:"#1e1b4b", border:"1px solid #3730a3", borderRadius:12, padding:"16px 20px" }}>
-                  <div style={{ fontSize:22, marginBottom:4 }}>{c.icon}</div>
-                  <div style={{ fontSize:22, fontWeight:700, color:"#fff" }}>{c.value}</div>
-                  <div style={{ fontSize:12, color:"#818cf8" }}>{c.label}</div>
-                </div>
-              ))}
-            </div>
-            {chartData.length > 0 && (
-              <div style={{ background:"#1e1b4b", border:"1px solid #3730a3", borderRadius:16, padding:20, marginBottom:20 }}>
-                <div style={{ fontWeight:600, color:"#c7d2fe", marginBottom:16, fontSize:14 }}>Hours per Day</div>
-                <div style={{ display:"flex", alignItems:"flex-end", gap:6, height:120 }}>
-                  {chartData.map(([date, hours], i) => (
-                    <div key={date} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
-                      <div style={{ fontSize:9, color:"#818cf8" }}>{hours.toFixed(1)}</div>
-                      <div style={{ width:"100%", height:`${(hours/maxH)*90}px`, background:COLORS[i%COLORS.length], borderRadius:"4px 4px 0 0", minHeight:3 }} />
-                      <div style={{ fontSize:9, color:"#6b7280", transform:"rotate(-45deg)", transformOrigin:"center", whiteSpace:"nowrap" }}>{date.slice(5)}</div>
+            {/* ── TIMESHEET TABLE ── */}
+            {(() => {
+              const COLS = "1fr 72px 40px";
+              const cellInp = { background:"#0f0f1a", border:"1px solid #4338ca", borderRadius:6, padding:"4px 7px", color:"#e2e8f0", fontSize:12, outline:"none", width:"100%" };
+
+              const EntryRow = ({e, i, list}) => {
+                const isEditing = editingId === e.id;
+                const project = e.project_id?.[1] || e.project_name || "No project";
+                const task    = e.task_id?.[1]    || e.task_name    || "";
+                const desc    = e.name            || e.description  || "";
+                const hours   = (e.unit_amount    || e.hours        || 0);
+                const color   = projectColor(project);
+                const borderBottom = i < list.length-1 ? "1px solid #1f2937" : "none";
+
+                if (isEditing) return (
+                  <div style={{ borderBottom, background:"#1e1b4b", borderRadius:8, padding:"10px 12px" }}>
+                    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:8 }}>
+                      <div>
+                        <div style={{ fontSize:10, color:"#6b7280", marginBottom:3, textTransform:"uppercase", fontWeight:700 }}>Project</div>
+                        <select value={editForm.project_id || ""} onChange={e2 => { const p = projects.find(p=>p.id==e2.target.value); setEditForm(f=>({...f,project_id:p?.id||null,project_name:p?.name||"",task_id:null,task_name:""})); }} style={cellInp}>
+                          <option value="">— none —</option>
+                          {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <div style={{ fontSize:10, color:"#6b7280", marginBottom:3, textTransform:"uppercase", fontWeight:700 }}>Task</div>
+                        <select value={editForm.task_id || ""} onChange={e2 => { const t = tasks.find(t=>t.id==e2.target.value); setEditForm(f=>({...f,task_id:t?.id||null,task_name:t?.name||""})); }} style={cellInp}>
+                          <option value="">— none —</option>
+                          {tasks.filter(t => !editForm.project_id || t.project_id?.[0]==editForm.project_id).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                        </select>
+                      </div>
+                      <div style={{ gridColumn:"1/-1" }}>
+                        <div style={{ fontSize:10, color:"#6b7280", marginBottom:3, textTransform:"uppercase", fontWeight:700 }}>Description</div>
+                        <input value={editForm.description} onChange={e2=>setEditForm(f=>({...f,description:e2.target.value}))} onKeyDown={e2=>{if(e2.key==="Enter")saveEdit();if(e2.key==="Escape"){setEditingId(null);setEditForm({});}}} style={cellInp} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize:10, color:"#6b7280", marginBottom:3, textTransform:"uppercase", fontWeight:700 }}>Hours</div>
+                        <input type="number" step="0.25" min="0" value={editForm.hours} onChange={e2=>setEditForm(f=>({...f,hours:e2.target.value}))} style={cellInp} />
+                      </div>
                     </div>
-                  ))}
-                </div>
-              </div>
-            )}
-            {historyLoading ? (
-              <div style={{ color:"#818cf8", textAlign:"center", padding:40 }}>⏳ Loading…</div>
-            ) : historyEntries.length === 0 ? (
-              <div style={{ color:"#6b7280", textAlign:"center", padding:40 }}>No entries found for this period.</div>
-            ) : (
-              <div style={{ background:"#1a1a2e", border:"1px solid #312e81", borderRadius:16, padding:16 }}>
-                <div style={{ fontWeight:700, color:"#c7d2fe", marginBottom:12, fontSize:14 }}>Timesheet Entries</div>
-                {historyEntries.map((e, i) => (
-                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom: i<historyEntries.length-1 ? "1px solid #1f2937" : "none" }}>
-                    <div style={{ flex:1 }}>
-                      <div style={{ fontSize:13, color:"#e2e8f0", fontWeight:500 }}>{e.name || e.description || "—"}</div>
-                      <div style={{ fontSize:11, color:"#818cf8", marginTop:2 }}>{e.project_id?.[1] || e.project_name || "No project"}{(e.task_id?.[1]||e.task_name) ? ` · ${e.task_id?.[1]||e.task_name}` : ""}</div>
-                    </div>
-                    <div style={{ textAlign:"right" }}>
-                      <div style={{ fontSize:14, fontWeight:700, color:"#a5b4fc" }}>{(e.unit_amount||e.hours||0).toFixed(2)}h</div>
-                      <div style={{ fontSize:11, color:"#6b7280" }}>{e.date}</div>
+                    <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                      <button onClick={saveEdit} disabled={editStatus==="saving"} style={{ padding:"5px 14px", borderRadius:6, border:"none", background:"#059669", color:"#fff", fontSize:12, fontWeight:600, cursor:"pointer" }}>{editStatus==="saving" ? "Saving…" : "Save"}</button>
+                      <button onClick={() => { setEditingId(null); setEditForm({}); setEditStatus(""); }} style={{ padding:"5px 14px", borderRadius:6, border:"1px solid #374151", background:"transparent", color:"#9ca3af", fontSize:12, cursor:"pointer" }}>Cancel</button>
+                      <button onClick={() => deleteEntry(e.id)} style={{ marginLeft:"auto", padding:"5px 12px", borderRadius:6, border:"1px solid #7f1d1d", background:"transparent", color:"#f87171", fontSize:12, cursor:"pointer" }}>Delete</button>
+                      {editStatus.startsWith("error") && <span style={{ color:"#f87171", fontSize:11 }}>{editStatus}</span>}
                     </div>
                   </div>
-                ))}
-              </div>
-            )}
+                );
+                return (
+                  <div style={{ display:"grid", gridTemplateColumns:COLS, gap:0, padding:"8px 12px", borderBottom, alignItems:"center" }}>
+                    <div style={{ overflow:"hidden", paddingRight:12 }}>
+                      <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+                        <div style={{ width:8, height:8, borderRadius:"50%", background:color, flexShrink:0 }} />
+                        <span style={{ fontSize:13, fontWeight:600, color:"#e2e8f0", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{project}</span>
+                      </div>
+                      {task && <div style={{ fontSize:12, color:"#818cf8", paddingLeft:15, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{task}</div>}
+                      {desc && <div style={{ fontSize:12, color:"#6b7280", paddingLeft:15, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{desc}</div>}
+                    </div>
+                    <div style={{ fontSize:14, fontWeight:700, color:"#a5b4fc", textAlign:"right" }}>{hours.toFixed(2)}h</div>
+                    <div style={{ display:"flex", gap:2, justifyContent:"flex-end" }}>
+                      <button title="Edit" onClick={() => { setEditingId(e.id); setEditForm({ date:e.date, project_id:e.project_id?.[0]||null, project_name:e.project_id?.[1]||e.project_name||"", task_id:e.task_id?.[0]||null, task_name:e.task_id?.[1]||e.task_name||"", hours:e.unit_amount||e.hours||0, description:e.name||e.description||"" }); setEditStatus(""); }} style={{ background:"transparent", border:"none", color:"#6366f1", cursor:"pointer", fontSize:13, padding:"2px 3px", borderRadius:4 }}>✎</button>
+                      <button title="Delete" onClick={() => deleteEntry(e.id)} style={{ background:"transparent", border:"none", color:"#374151", cursor:"pointer", fontSize:13, padding:"2px 3px", borderRadius:4 }}>✕</button>
+                    </div>
+                  </div>
+                );
+              };
+
+              const ColHeaders = () => (
+                <div style={{ display:"grid", gridTemplateColumns:COLS, gap:0, padding:"6px 12px", borderRadius:8, background:"#0f0f1a", marginBottom:4 }}>
+                  {["Entry","Hours",""].map((h,i) => (
+                    <div key={i} style={{ fontSize:11, fontWeight:700, color:"#6b7280", letterSpacing:"0.06em", textTransform:"uppercase", textAlign:i===1?"right":"left" }}>{h}</div>
+                  ))}
+                </div>
+              );
+
+              // Navigation: day moves ±1 day, week moves ±7 days
+              const nudge = (n) => { const d = new Date(tableDate); d.setDate(d.getDate()+n); setTableDate(d.toISOString().split("T")[0]); };
+              const weekDays = weekDaysOf(tableDate);
+              const weekLabel = (() => {
+                const s = new Date(weekDays[0]), e2 = new Date(weekDays[6]);
+                return `${s.toLocaleDateString("en-GB",{day:"numeric",month:"short"})} – ${e2.toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`;
+              })();
+
+              return (
+                <div style={{ background:"#1a1a2e", border:"1px solid #312e81", borderRadius:16, padding:20, marginTop:20 }}>
+                  {/* Header: title + view toggle + navigation */}
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16, flexWrap:"wrap", gap:10 }}>
+                    <div style={{ fontWeight:700, fontSize:15, color:"#c7d2fe" }}>Timesheet</div>
+                    <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                      {/* Day / Week toggle */}
+                      <div style={{ display:"flex", background:"#0f0f1a", borderRadius:8, padding:3, gap:2 }}>
+                        {[["day","Day"],["week","Week"]].map(([v,label]) => (
+                          <button key={v} onClick={() => setTableView(v)} style={{ padding:"4px 14px", borderRadius:6, border:"none", cursor:"pointer", fontSize:12, fontWeight:600, background:tableView===v?"#6366f1":"transparent", color:tableView===v?"#fff":"#818cf8" }}>{label}</button>
+                        ))}
+                      </div>
+                      <button onClick={() => nudge(tableView==="week"?-7:-1)} style={{ background:"#1e1b4b", border:"1px solid #3730a3", borderRadius:6, color:"#a5b4fc", cursor:"pointer", padding:"4px 10px", fontSize:16, lineHeight:1 }}>‹</button>
+                      {tableView === "day"
+                        ? <input type="date" value={tableDate} onChange={e => setTableDate(e.target.value)} style={{ background:"#0f0f1a", border:"1px solid #3730a3", borderRadius:6, padding:"4px 8px", color:"#c7d2fe", fontSize:13, outline:"none" }} />
+                        : <span style={{ fontSize:13, color:"#c7d2fe", padding:"4px 4px" }}>{weekLabel}</span>
+                      }
+                      <button onClick={() => nudge(tableView==="week"?7:1)} style={{ background:"#1e1b4b", border:"1px solid #3730a3", borderRadius:6, color:"#a5b4fc", cursor:"pointer", padding:"4px 10px", fontSize:16, lineHeight:1 }}>›</button>
+                      <button onClick={() => refreshCurrentView()} style={{ background:"transparent", border:"1px solid #3730a3", borderRadius:6, color:"#818cf8", cursor:"pointer", padding:"4px 10px", fontSize:13 }}>↻</button>
+                    </div>
+                  </div>
+
+                  {/* ── DAY VIEW ── */}
+                  {tableView === "day" && (
+                    tableLoading ? <div style={{ color:"#818cf8", textAlign:"center", padding:"32px 0", fontSize:13 }}>⏳ Loading…</div>
+                    : <>
+                        {tableEntries.length > 0 && <>
+                          <ColHeaders />
+                          {tableEntries.map((e,i) => <EntryRow key={e.id||i} e={e} i={i} list={tableEntries} />)}
+                          <div style={{ display:"grid", gridTemplateColumns:COLS, padding:"8px 12px", borderTop:"2px solid #3730a3", marginTop:2 }}>
+                            <div style={{ fontSize:11, fontWeight:700, color:"#6b7280", letterSpacing:"0.06em", textTransform:"uppercase" }}>Total</div>
+                            <div style={{ fontSize:15, fontWeight:800, color:"#c7d2fe", textAlign:"right" }}>{tableEntries.reduce((s,e)=>s+(e.unit_amount||e.hours||0),0).toFixed(2)}h</div>
+                          </div>
+                        </>}
+                        {/* Quick-add row */}
+                        {(() => {
+                          const qInp = { background:"#0f0f1a", border:"1px solid #2d3748", borderRadius:6, padding:"4px 7px", color:"#e2e8f0", fontSize:12, outline:"none", width:"100%" };
+                          const onSubmit = () => submitQuickEntry(tableDate);
+                          return (
+                            <div style={{ display:"grid", gridTemplateColumns:COLS, gap:6, padding:"8px 12px", borderTop: tableEntries.length>0 ? "1px dashed #2d3748" : "none", alignItems:"center", background:"#0a0a16", borderRadius: tableEntries.length===0 ? 8 : "0 0 8px 8px" }}>
+                              <div style={{ display:"flex", flexDirection:"column", gap:4, paddingLeft:15 }}>
+                                <select value={quickEntry.project_id||""} onChange={e2=>{const p=projects.find(p=>p.id==e2.target.value);setQuickEntry(prev=>({...prev,project_id:p?.id||null,project_name:p?.name||"",task_id:null,task_name:""}));}} style={{...qInp, color:quickEntry.project_id?"#e2e8f0":"#4b5563"}}>
+                                  <option value="">Project…</option>
+                                  {projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+                                </select>
+                                <select value={quickEntry.task_id||""} onChange={e2=>{const t=tasks.find(t=>t.id==e2.target.value);setQuickEntry(prev=>({...prev,task_id:t?.id||null,task_name:t?.name||""}));}} style={{...qInp, color:quickEntry.task_id?"#e2e8f0":"#4b5563"}}>
+                                  <option value="">Task…</option>
+                                  {tasks.filter(t=>!quickEntry.project_id||t.project_id?.[0]==quickEntry.project_id).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
+                                </select>
+                                <input value={quickEntry.description} onChange={e2=>setQuickEntry(p=>({...p,description:e2.target.value}))} onKeyDown={e2=>{if(e2.key==="Enter")onSubmit();}} placeholder="Description…" style={qInp} />
+                              </div>
+                              <input type="number" step="0.25" min="0" value={quickEntry.hours} onChange={e2=>setQuickEntry(p=>({...p,hours:e2.target.value}))} onKeyDown={e2=>{if(e2.key==="Enter")onSubmit();}} placeholder="0.00" style={{...qInp,textAlign:"right"}} />
+                              <button onClick={onSubmit} disabled={quickStatus==="submitting"} title="Add entry (Enter)" style={{ background: quickStatus==="ok"?"#059669":"#1e3a2e", border:"1px solid #065f46", borderRadius:6, color: quickStatus==="ok"?"#fff":"#34d399", cursor:"pointer", fontSize:16, padding:"4px", display:"flex", alignItems:"center", justifyContent:"center", width:"100%", height:28, alignSelf:"center" }}>
+                                {quickStatus==="submitting"?"…":quickStatus==="ok"?"✓":"+"}
+                              </button>
+                            </div>
+                          );
+                        })()}
+                      </>
+                  )}
+
+                  {/* ── WEEK VIEW (transposed grid) ── */}
+                  {tableView === "week" && (
+                    weekLoading ? <div style={{ color:"#818cf8", textAlign:"center", padding:"32px 0", fontSize:13 }}>⏳ Loading…</div>
+                    : (() => {
+                        // Build rows: unique (project, task) combos; each day cell holds an array of entries
+                        const rowMap = {};
+                        const rowOrder = [];
+                        weekEntries.forEach(e => {
+                          const key = `${e.project_id?.[0]??''}|${e.task_id?.[0]??''}`;
+                          if (!rowMap[key]) {
+                            rowMap[key] = { key, project_id:e.project_id?.[0]||null, project_name:e.project_id?.[1]||e.project_name||'', task_id:e.task_id?.[0]||null, task_name:e.task_id?.[1]||e.task_name||'', days:{} };
+                            rowOrder.push(key);
+                          }
+                          if (!rowMap[key].days[e.date]) rowMap[key].days[e.date] = [];
+                          rowMap[key].days[e.date].push(e);
+                        });
+                        const rows = rowOrder.map(k => rowMap[k]);
+                        const WCOLS = `200px repeat(7, 52px) 56px`;
+                        const dayTotals = weekDays.map(d => weekEntries.filter(e=>e.date===d).reduce((s,e)=>s+(e.unit_amount||e.hours||0),0));
+                        const weekTotal = weekEntries.reduce((s,e)=>s+(e.unit_amount||e.hours||0),0);
+                        const cellStyle = (hasVal, isWeekend, isToday, isHovered) => ({ textAlign:"center", fontSize:13, fontWeight:hasVal?700:400, color:hasVal?(isToday?"#c7d2fe":"#a5b4fc"):isHovered?"#4b5563":"#2d3748", background:isHovered?"#2e2b52":(isToday?"#1e1b4b":isWeekend?"#0a0a14":"transparent"), borderRadius:4, cursor:"pointer", padding:"6px 4px", userSelect:"none", transition:"background 0.1s" });
+                        return (
+                          <>
+                            {/* Column headers */}
+                            <div style={{ display:"grid", gridTemplateColumns:WCOLS, gap:0, padding:"6px 8px", borderRadius:8, background:"#0f0f1a", marginBottom:4, alignItems:"center" }}>
+                              <div style={{ fontSize:11, fontWeight:700, color:"#6b7280", letterSpacing:"0.06em", textTransform:"uppercase" }}>Entry</div>
+                              {weekDays.map((d,di) => {
+                                const isToday = d===todayISO(), isWeekend=di>=5;
+                                const date = new Date(d);
+                                return (
+                                  <div key={d} style={{ textAlign:"center", background:isToday?"#1e1b4b":isWeekend?"#0a0a14":"transparent", borderRadius:4, padding:"3px 2px" }}>
+                                    <div style={{ fontSize:10, fontWeight:700, color:isToday?"#a5b4fc":isWeekend?"#4b5563":"#6b7280", textTransform:"uppercase" }}>{DAY_NAMES[di]}</div>
+                                    <div style={{ fontSize:11, color:isToday?"#c7d2fe":isWeekend?"#374151":"#4b5563" }}>{date.getDate()}</div>
+                                  </div>
+                                );
+                              })}
+                              <div style={{ fontSize:11, fontWeight:700, color:"#6b7280", letterSpacing:"0.06em", textTransform:"uppercase", textAlign:"center" }}>Total</div>
+                            </div>
+
+                            {rows.length === 0 && <div style={{ color:"#4b5563", textAlign:"center", padding:"32px 0", fontSize:13 }}>No entries this week.</div>}
+
+                            {rows.map((row, ri) => {
+                              const rowTotal = Object.values(row.days).reduce((s,arr)=>s+arr.reduce((s2,e)=>s2+(e.unit_amount||e.hours||0),0),0);
+                              const color = projectColor(row.project_name);
+                              return (
+                                <div key={row.key} style={{ display:"grid", gridTemplateColumns:WCOLS, gap:0, padding:"4px 8px", borderBottom:"1px solid #1f2937", alignItems:"center", minHeight:40 }}>
+                                  {/* Project · Task */}
+                                  <div style={{ paddingRight:8, minWidth:0 }}>
+                                    <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                                      <div style={{ width:8, height:8, borderRadius:"50%", background:color, flexShrink:0 }} />
+                                      <span style={{ fontSize:12, fontWeight:600, color:"#e2e8f0", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{row.project_name||"No project"}</span>
+                                    </div>
+                                    {row.task_name && <div style={{ fontSize:11, color:"#818cf8", paddingLeft:14, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{row.task_name}</div>}
+                                  </div>
+                                  {/* Day cells */}
+                                  {weekDays.map((day, di) => {
+                                    const entries = row.days[day] || [];
+                                    const hours = entries.reduce((s,e)=>s+(e.unit_amount||e.hours||0),0);
+                                    const isWeekend = di>=5, isToday = day===todayISO();
+                                    const cellKey = `${row.key}|${day}`;
+                                    const isHovered = rowTooltip === cellKey;
+                                    const desc = entries.map(e=>e.name||e.description||"").filter(Boolean).join("; ");
+                                    return (
+                                      <div key={day} style={{ position:"relative" }}
+                                        onMouseEnter={()=>setRowTooltip(cellKey)}
+                                        onMouseLeave={()=>setRowTooltip(null)}>
+                                        <div onClick={()=>setDescPopup({ row, day, entries: entries.length>0 ? entries.map(e=>({ id:e.id, hours:String(e.unit_amount||e.hours||0), desc:e.name||e.description||"" })) : [{id:null,hours:"",desc:""}] })} style={cellStyle(hours>0,isWeekend,isToday,isHovered)}>
+                                          {hours>0 ? hours.toFixed(2) : <span style={{fontSize:16,color:isHovered?"#4b5563":"#1f2937"}}>+</span>}
+                                        </div>
+                                        {isHovered && desc && (
+                                          <div style={{ position:"absolute", bottom:"calc(100% + 6px)", left:"50%", transform:"translateX(-50%)", zIndex:200, background:"#1e1b4b", border:"1px solid #4338ca", borderRadius:8, padding:"8px 12px", fontSize:12, color:"#c7d2fe", width:220, boxShadow:"0 4px 16px rgba(0,0,0,0.6)", pointerEvents:"none" }}>
+                                            {entries.map((e,i) => <div key={i} style={{lineHeight:1.4, marginBottom: i<entries.length-1?4:0}}>{e.name||e.description||""} <span style={{color:"#818cf8",whiteSpace:"nowrap"}}>({Number(e.unit_amount||e.hours||0).toFixed(2)}h)</span></div>)}
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                  {/* Row total */}
+                                  <div style={{ fontSize:13, fontWeight:700, color:"#c7d2fe", textAlign:"center" }}>{rowTotal.toFixed(2)}</div>
+                                </div>
+                              );
+                            })}
+
+                            {/* Day totals footer */}
+                            <div style={{ display:"grid", gridTemplateColumns:WCOLS, gap:0, padding:"8px 8px", borderTop:"2px solid #3730a3", marginTop:2, alignItems:"center" }}>
+                              <div style={{ fontSize:11, fontWeight:700, color:"#6b7280", letterSpacing:"0.06em", textTransform:"uppercase" }}>Total</div>
+                              {dayTotals.map((t,di) => (
+                                <div key={di} style={{ fontSize:13, fontWeight:700, color:t>0?"#a5b4fc":"#2d3748", textAlign:"center" }}>{t>0?t.toFixed(2):"—"}</div>
+                              ))}
+                              <div style={{ fontSize:14, fontWeight:800, color:"#c7d2fe", textAlign:"center" }}>{weekTotal.toFixed(2)}</div>
+                            </div>
+
+                            {/* Week quick-add row */}
+                            {(() => {
+                              const qInp = { background:"#0f0f1a", border:"1px solid #2d3748", borderRadius:6, padding:"4px 6px", color:"#e2e8f0", fontSize:12, outline:"none", width:"100%" };
+                              return (
+                                <div style={{ display:"grid", gridTemplateColumns:WCOLS, gap:4, padding:"8px 8px", borderTop:"1px dashed #1f2937", alignItems:"center", background:"#0a0a16" }}>
+                                  <div style={{ display:"flex", flexDirection:"column", gap:3 }}>
+                                    <select value={quickEntry.project_id||""} onChange={e2=>{const p=projects.find(p=>p.id==e2.target.value);setQuickEntry(prev=>({...prev,project_id:p?.id||null,project_name:p?.name||"",task_id:null,task_name:""}));}} style={{...qInp,color:quickEntry.project_id?"#e2e8f0":"#4b5563"}}>
+                                      <option value="">Project…</option>
+                                      {projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+                                    </select>
+                                    <select value={quickEntry.task_id||""} onChange={e2=>{const t=tasks.find(t=>t.id==e2.target.value);setQuickEntry(prev=>({...prev,task_id:t?.id||null,task_name:t?.name||""}));}} style={{...qInp,color:quickEntry.task_id?"#e2e8f0":"#4b5563"}}>
+                                      <option value="">Task…</option>
+                                      {tasks.filter(t=>!quickEntry.project_id||t.project_id?.[0]==quickEntry.project_id).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
+                                    </select>
+                                    <input value={quickEntry.description} onChange={e2=>setQuickEntry(p=>({...p,description:e2.target.value}))} placeholder="Description…" style={qInp} />
+                                  </div>
+                                  {weekDays.map((day,di) => {
+                                    const ck = `__new__|${day}`;
+                                    const isEditing = cellEditKey === ck;
+                                    const isWeekend = di>=5, isToday = day===todayISO();
+                                    if (isEditing) return (
+                                      <div key={day} style={{ padding:"2px" }}>
+                                        <input autoFocus type="number" step="0.25" min="0" value={cellEditVal}
+                                          onChange={e2=>setCellEditVal(e2.target.value)}
+                                          onBlur={()=>saveCellEdit("__new__",day,null)}
+                                          onKeyDown={e2=>{if(e2.key==="Enter")saveCellEdit("__new__",day,null);if(e2.key==="Escape"){setCellEditKey(null);setCellEditVal("");}}}
+                                          style={{ width:"100%", background:"#0f0f1a", border:"1px solid #6366f1", borderRadius:4, padding:"4px 2px", color:"#e2e8f0", fontSize:12, outline:"none", textAlign:"center" }} />
+                                      </div>
+                                    );
+                                    return (
+                                      <div key={day} onClick={()=>{setCellEditKey(ck);setCellEditVal("");}} style={{ textAlign:"center", fontSize:18, color:"#1f2937", cursor:"pointer", background:isToday?"#1a1a30":isWeekend?"#0a0a14":"transparent", borderRadius:4, padding:"5px 0", userSelect:"none" }}>+</div>
+                                    );
+                                  })}
+                                  <div></div>
+                                </div>
+                              );
+                            })()}
+                          </>
+                        );
+                      })()
+                  )}
+                </div>
+              );
+            })()}
           </div>
         )}
 
@@ -423,6 +871,16 @@ function App() {
                 <label style={lbl}>API Key</label>
                 <input type="password" value={sf.anthropicKey} onChange={e => setSf(p=>({...p,anthropicKey:e.target.value}))} placeholder="sk-ant-..." style={inp} />
               </div>
+              <hr style={{ border:"none", borderTop:"1px solid #312e81", margin:"20px 0" }} />
+              <div style={{ fontWeight:700, fontSize:14, color:"#c7d2fe", marginBottom:4 }}>📝 Personal Context</div>
+              <div style={{ fontSize:12, color:"#818cf8", marginBottom:12 }}>
+                Describe your projects, shorthand codes, or preferences. This is always sent to the AI to help it map your descriptions to the right entries.
+              </div>
+              <div style={{ marginBottom:20 }}>
+                <textarea value={sf.userContext} onChange={e => setSf(p=>({...p,userContext:e.target.value}))}
+                  placeholder={"e.g.\n- 'ACME' = Acme Corp Redesign project, task Backend API\n- 'standup' always maps to Internal > Daily Standup\n- I work on the mobile team, default project is Mobile App"}
+                  style={{ ...inp, minHeight:120, resize:"vertical", lineHeight:1.6 }} />
+              </div>
               <div style={{ display:"flex", gap:10, flexWrap:"wrap", alignItems:"center" }}>
                 <button onClick={testConnection} disabled={odooConnecting} style={{ padding:"9px 18px", borderRadius:8, border:"1px solid #4338ca", background:"transparent", color:"#a5b4fc", cursor:"pointer", fontSize:13, fontWeight:600 }}>
                   {odooConnecting ? "Testing…" : "🔌 Test Connection"}
@@ -448,6 +906,44 @@ function App() {
         )}
 
       </div>
+
+      {descPopup && (
+        <div onClick={()=>setDescPopup(null)} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", zIndex:999, display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <div onClick={e=>e.stopPropagation()} style={{ background:"#1e1b4b", border:"1px solid #4338ca", borderRadius:16, padding:24, width:460, maxHeight:"80vh", overflowY:"auto", boxShadow:"0 8px 32px rgba(0,0,0,0.6)" }}>
+            <div style={{ fontWeight:700, fontSize:15, color:"#c7d2fe", marginBottom:4 }}>Edit Entries</div>
+            <div style={{ fontSize:12, color:"#6b7280", marginBottom:16 }}>
+              {descPopup.row.project_name||"No project"}{descPopup.row.task_name ? ` · ${descPopup.row.task_name}` : ""} <span style={{ color:"#4b5563" }}>·</span> {descPopup.day}
+            </div>
+            {descPopup.entries.map((ent, idx) => (
+              <div key={idx} style={{ display:"flex", gap:8, alignItems:"flex-end", marginBottom:10 }}>
+                <div style={{ flex:"0 0 80px" }}>
+                  {idx === 0 && <label style={{ fontSize:11, color:"#818cf8", display:"block", marginBottom:3 }}>Hours</label>}
+                  <input autoFocus={idx===0} type="number" step="0.25" min="0" value={ent.hours}
+                    onChange={e=>setDescPopup(p=>({...p,entries:p.entries.map((e2,i)=>i===idx?{...e2,hours:e.target.value}:e2)}))}
+                    onKeyDown={e=>{if(e.key==="Escape")setDescPopup(null);}}
+                    style={{ width:"100%", background:"#0f0f1a", border:"1px solid #3730a3", borderRadius:8, padding:"8px 10px", color:"#e2e8f0", fontSize:13, outline:"none" }} />
+                </div>
+                <div style={{ flex:1 }}>
+                  {idx === 0 && <label style={{ fontSize:11, color:"#818cf8", display:"block", marginBottom:3 }}>Description</label>}
+                  <input value={ent.desc}
+                    onChange={e=>setDescPopup(p=>({...p,entries:p.entries.map((e2,i)=>i===idx?{...e2,desc:e.target.value}:e2)}))}
+                    onKeyDown={e=>{if(e.key==="Enter"&&e.metaKey){e.preventDefault();saveDescPopup();}if(e.key==="Escape")setDescPopup(null);}}
+                    style={{ width:"100%", background:"#0f0f1a", border:"1px solid #3730a3", borderRadius:8, padding:"8px 10px", color:"#e2e8f0", fontSize:13, outline:"none" }} />
+                </div>
+              </div>
+            ))}
+            <button onClick={()=>setDescPopup(p=>({...p,entries:[...p.entries,{id:null,hours:"",desc:""}]}))}
+              style={{ width:"100%", background:"transparent", border:"1px dashed #3730a3", borderRadius:8, color:"#6b7280", cursor:"pointer", fontSize:12, padding:"6px 0", marginBottom:14, marginTop:2 }}>
+              + Add entry
+            </button>
+            <div style={{ fontSize:11, color:"#4b5563", marginBottom:12 }}>⌘↵ to save · Esc to cancel</div>
+            <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
+              <button onClick={()=>setDescPopup(null)} style={{ padding:"8px 16px", borderRadius:8, border:"1px solid #3730a3", cursor:"pointer", background:"transparent", color:"#818cf8", fontSize:13 }}>Cancel</button>
+              <button onClick={saveDescPopup} style={{ padding:"8px 20px", borderRadius:8, border:"none", cursor:"pointer", background:"linear-gradient(135deg,#6366f1,#8b5cf6)", color:"#fff", fontWeight:600, fontSize:13 }}>Save</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
