@@ -920,11 +920,22 @@ function App() {
                 return `${s.toLocaleDateString("en-GB",{day:"numeric",month:"short"})} – ${e2.toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`;
               })();
 
+              const today = todayISO();
+              const isToday = tableView === "day" && tableDate === today;
+              const isThisWeek = tableView === "week" && weekStartOf(tableDate) === weekStartOf(today);
+              const notCurrent = !isToday && !isThisWeek;
+
               return (
                 <div>
                   <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:20, flexWrap:"wrap", gap:10 }}>
-                    <h2 style={{ fontSize:18, fontWeight:700, color:"var(--text)" }}>Timesheet</h2>
-                    <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                    <h2 style={{ fontSize:18, fontWeight:700, color:"var(--text)" }}>Your timesheet</h2>
+                    <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap", justifyContent:"flex-end" }}>
+                      {notCurrent && (
+                        <button onClick={() => setTableDate(today)}
+                          style={{ fontSize:11, color:"var(--text-lo)", background:"none", border:"none", cursor:"pointer", padding:"0 6px 0 0", fontWeight:500, whiteSpace:"nowrap", borderRight:"1px solid var(--border-mid)", marginRight:2 }}>
+                          ← today
+                        </button>
+                      )}
                       <div style={{ display:"flex", border:"1px solid var(--border)", borderRadius:7, overflow:"hidden" }}>
                         {[["day","Day"],["week","Week"]].map(([v,label]) => (
                           <button key={v} onClick={() => setTableView(v)} style={{ padding:"5px 14px", border:"none", cursor:"pointer", fontSize:12, fontWeight:600, background:tableView===v?"var(--accent)":"transparent", color:tableView===v?"#fff":"var(--text-mid)", borderRight: v==="day" ? "1px solid var(--border)" : "none" }}>{label}</button>
@@ -932,8 +943,8 @@ function App() {
                       </div>
                       <button onClick={() => nudge(tableView==="week"?-7:-1)} style={{ background:"none", border:"1px solid var(--border)", borderRadius:6, color:"var(--text-mid)", cursor:"pointer", padding:"5px 10px", fontSize:15, lineHeight:1 }}>‹</button>
                       {tableView === "day"
-                        ? <input type="date" value={tableDate} onChange={e => setTableDate(e.target.value)} style={{ background:"var(--surface)", border:"1px solid var(--border)", borderRadius:6, padding:"5px 8px", color:"var(--text)", fontSize:13, outline:"none" }} />
-                        : <span style={{ fontSize:13, color:"var(--text-mid)", padding:"5px 4px" }}>{weekLabel}</span>
+                        ? <input type="date" value={tableDate} onChange={e => setTableDate(e.target.value)} style={{ background:"var(--surface)", border:"1px solid var(--border)", borderRadius:6, padding:"5px 8px", color:"var(--text)", fontSize:13, outline:"none", minWidth:0 }} />
+                        : <span style={{ fontSize:13, color:"var(--text-mid)", padding:"5px 4px", whiteSpace:"nowrap" }}>{weekLabel}</span>
                       }
                       <button onClick={() => nudge(tableView==="week"?7:1)} style={{ background:"none", border:"1px solid var(--border)", borderRadius:6, color:"var(--text-mid)", cursor:"pointer", padding:"5px 10px", fontSize:15, lineHeight:1 }}>›</button>
                       <button onClick={() => refreshCurrentView()} style={{ background:"none", border:"1px solid var(--border)", borderRadius:6, color:"var(--text-lo)", cursor:"pointer", padding:"5px 10px", fontSize:13 }}>↻</button>
