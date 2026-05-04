@@ -12,19 +12,45 @@ const http = require("http");
 const path = require("path");
 const fs   = require("fs");
 
-let keytar;
-try {
-  keytar = require("keytar");
-} catch {
-  console.error("❌  keytar not found. Run: npm install keytar");
-  process.exit(1);
-}
-
-const PORT    = 3010;
+const PORT    = process.versions.electron ? 3011 : 3010;
 const SERVICE = "odoo-time-tracker";
 const ODOO_KEY  = "odoo_creds";     // stores JSON: { url, db, email, password }
 const ANTH_KEY  = "anthropic_key";  // stores raw API key string
 const CTX_KEY   = "user_context";   // stores freeform user context string
+
+// ── Credential storage: safeStorage+file in Electron, keytar in standalone ──
+let keytar;
+if (process.versions.electron) {
+  const { safeStorage } = require("electron");
+  const credPath = path.join(require("electron").app.getPath("userData"), "creds.json");
+  const readStore = () => { try { return JSON.parse(fs.readFileSync(credPath, "utf8")); } catch { return {}; } };
+  const writeStore = (store) => fs.writeFileSync(credPath, JSON.stringify(store));
+  keytar = {
+    async getPassword(_svc, key) {
+      const store = readStore();
+      if (!store[key]) return null;
+      return safeStorage.decryptString(Buffer.from(store[key], "base64"));
+    },
+    async setPassword(_svc, key, value) {
+      const store = readStore();
+      store[key] = safeStorage.encryptString(value).toString("base64");
+      writeStore(store);
+    },
+    async deletePassword(_svc, key) {
+      const store = readStore();
+      delete store[key];
+      writeStore(store);
+      return true;
+    },
+  };
+} else {
+  try {
+    keytar = require("keytar");
+  } catch {
+    console.error("❌  keytar not found. Run: npm install keytar");
+    process.exit(1);
+  }
+}
 
 // ── Read the HTML file (same directory as this script) ──
 const HTML_PATH = path.join(__dirname, "odoo-tracker.html");
@@ -133,9 +159,17 @@ server.listen(PORT, () => {
   console.log("  Press Ctrl+C to stop");
   console.log("");
 
-  const url = `http://localhost:${PORT}`;
-  const cmd = process.platform === "win32" ? `start "" "${url}"`
-    : process.platform === "darwin" ? `open "${url}"`
-    : `xdg-open "${url}"`;
-  require("child_process").exec(cmd);
+  if (!process.versions.electron) {
+    const url = `http://localhost:${PORT}`;
+    const cmd = process.platform === "win32" ? `start "" "${url}"`
+      : process.platform === "darwin" ? `open "${url}"`
+      : `xdg-open "${url}"`;
+    require("child_process").exec(cmd);
+  }
+}).on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`\n  ❌  Port ${PORT} is already in use. Is another instance running?\n`);
+    process.exit(1);
+  }
+  throw err;
 });
