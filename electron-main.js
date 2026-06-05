@@ -86,6 +86,11 @@ function createWindow() {
   win.loadFile("odoo-tracker.html");
 }
 
+// Prevent Chromium from accessing the OS keychain for its internal storage
+// (cookies, localStorage encryption). We manage credentials ourselves via
+// the `security` CLI so this internal encryption isn't needed.
+app.commandLine.appendSwitch("use-mock-keychain");
+
 app.whenReady().then(createWindow);
 
 app.on("window-all-closed", () => app.quit());
