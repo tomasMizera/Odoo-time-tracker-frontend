@@ -169,28 +169,29 @@ function ProjectSelect({ value, onChange, projects, recentProjectIds, style, pla
 const BASE = "http://localhost:3010";
 
 async function odooRPC(method, args) {
-  const res = await fetch(`${BASE}/jsonrpc`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "call", params: { service: args[0], method: args[1], args: args[2] } })
-  });
+  const payload = { jsonrpc: "2.0", id: 1, method: "call", params: { service: args[0], method: args[1], args: args[2] } };
+  if (window.electronAPI) {
+    const data = await window.electronAPI.odoo.rpc(payload);
+    if (data.error) throw new Error(data.error.data?.message || data.error.message || "Odoo error");
+    return data.result;
+  }
+  const res = await fetch(`${BASE}/jsonrpc`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
   const data = await res.json();
   if (data.error) throw new Error(data.error.data?.message || data.error.message || "Odoo error");
   return data.result;
 }
 
 async function keychainGet() {
+  if (window.electronAPI) return window.electronAPI.keychain.get();
   const res = await fetch(`${BASE}/keychain/creds`);
   return res.json();
 }
 async function keychainSave(creds, anthropicKey, userContext) {
-  await fetch(`${BASE}/keychain/creds`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ creds, anthropicKey, userContext })
-  });
+  if (window.electronAPI) { await window.electronAPI.keychain.save({ creds, anthropicKey, userContext }); return; }
+  await fetch(`${BASE}/keychain/creds`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ creds, anthropicKey, userContext }) });
 }
 async function keychainDelete() {
+  if (window.electronAPI) { await window.electronAPI.keychain.delete(); return; }
   await fetch(`${BASE}/keychain/delete`, { method: "POST" });
 }
 
@@ -280,16 +281,23 @@ function App() {
   const [monthsData, setMonthsData] = useState(null);
   const [monthsLoading, setMonthsLoading] = useState(false);
 
-  const [darkMode, setDarkMode] = useState(() => {
-    const s = localStorage.getItem("odoo-tracker-theme");
-    if (s) return s === "dark";
-    return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
-  });
+  const [themeMode, setThemeMode] = useState(() => localStorage.getItem("odoo-tracker-theme") || "system");
+  const [sysDark, setSysDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
+  const [themeOpen, setThemeOpen] = useState(false);
   const [palette, setPalette] = useState(() => localStorage.getItem("odoo-tracker-palette") || "forest");
 
   useEffect(() => {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = (e) => setSysDark(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+
+  const darkMode = themeMode === "dark" || (themeMode === "system" && sysDark);
+
+  useEffect(() => {
     document.body.setAttribute("data-theme", darkMode ? "dark" : "light");
-    localStorage.setItem("odoo-tracker-theme", darkMode ? "dark" : "light");
+    localStorage.setItem("odoo-tracker-theme", themeMode);
     const pal = PALETTES.find(p => p.id === palette) || PALETTES[0];
     const v = darkMode ? pal.dark : pal.light;
     const b = document.body;
@@ -300,7 +308,7 @@ function App() {
     b.style.setProperty("--accent-text-hi", v.textHi);
     b.style.setProperty("--accent-text-lo", v.textLo);
     b.style.setProperty("--border-accent", v.border);
-  }, [darkMode, palette]);
+  }, [darkMode, themeMode, palette]);
 
   const [aiInput, setAiInput] = useState("");
   const [parsedEntries, setParsedEntries] = useState([]);
@@ -665,7 +673,7 @@ function App() {
       <div className="electron-drag" style={{
         background:"var(--bg)",
         borderBottom:"1px solid var(--border)",
-        padding:"0 32px",
+        padding: window.electronAPI ? "0 32px 0 80px" : "0 32px",
         display:"flex",
         alignItems:"center",
         height:52,
@@ -707,35 +715,50 @@ function App() {
             <span style={{ fontSize:8 }}>●</span>
             {hasCreds ? "Connected" : "Not connected"}
           </span>
-          <button onClick={() => setDarkMode(d => !d)}
-            title={darkMode ? "Switch to light mode" : "Switch to dark mode"}
-            style={{
-              background:"none",
-              border:"1px solid var(--border)",
-              borderRadius:6,
-              padding:"4px 8px",
-              color:"var(--text-lo)",
-              cursor:"pointer",
-              fontSize:15,
-              lineHeight:1,
-              flexShrink:0
-            }}>
-            {darkMode ? "☀" : "🌙"}
-          </button>
+          {(() => {
+            const THEME_OPTS = [
+              { mode:"system", label:"System", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg> },
+              { mode:"light",  label:"Light",  icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg> },
+              { mode:"dark",   label:"Dark",   icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg> },
+            ];
+            const current = THEME_OPTS.find(o => o.mode === themeMode) || THEME_OPTS[0];
+            return (
+              <div style={{ position:"relative", flexShrink:0 }}>
+                <button onClick={() => setThemeOpen(o => !o)} title="Appearance"
+                  style={{ background:"none", border:"1px solid var(--border)", borderRadius:6, padding:"5px 8px", color:"var(--text-lo)", cursor:"pointer", lineHeight:1, display:"flex", alignItems:"center" }}>
+                  {current.icon}
+                </button>
+                {themeOpen && (
+                  <>
+                    <div onClick={() => setThemeOpen(false)} style={{ position:"fixed", inset:0, zIndex:99 }} />
+                    <div style={{ position:"absolute", right:0, top:"calc(100% + 6px)", background:"var(--surface)", border:"1px solid var(--border)", borderRadius:10, padding:4, zIndex:100, boxShadow:"0 4px 16px rgba(0,0,0,0.12)", minWidth:120 }}>
+                      {THEME_OPTS.map(({ mode, label, icon }) => (
+                        <button key={mode} onClick={() => { setThemeMode(mode); setThemeOpen(false); }}
+                          style={{ display:"flex", alignItems:"center", gap:9, width:"100%", padding:"7px 10px", background: themeMode === mode ? "var(--well)" : "none", border:"none", borderRadius:7, color: themeMode === mode ? "var(--text)" : "var(--text-mid)", cursor:"pointer", fontSize:13, fontWeight: themeMode === mode ? 600 : 400, textAlign:"left" }}>
+                          {icon}{label}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })()}
           <button onClick={() => setTab(tab === "Settings" ? "Log Time" : "Settings")}
             title="Settings"
             style={{
               background: tab === "Settings" ? "var(--well)" : "none",
               border:"1px solid var(--border)",
               borderRadius:6,
-              padding:"4px 8px",
+              padding:"5px 8px",
               color: tab === "Settings" ? "var(--text)" : "var(--text-lo)",
               cursor:"pointer",
-              fontSize:15,
               lineHeight:1,
-              flexShrink:0
+              flexShrink:0,
+              display:"flex",
+              alignItems:"center",
             }}>
-            ⚙
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           </button>
         </div>
       </div>

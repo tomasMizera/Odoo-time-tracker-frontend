@@ -1,0 +1,30 @@
+{
+  "name": "odoo-tracker",
+  "version": "1.0.0",
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "node odoo-proxy.js",
+    "electron": "electron .",
+    "dist": "electron-builder --mac dmg"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^35.0.1",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.odoo-tracker.app",
+    "productName": "Odoo Tracker",
+    "icon": "icon.icns",
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": "dmg",
+      "icon": "icon.icns"
+    },
+    "files": [
+      "electron-main.js",
+      "preload.js",
+      "odoo-tracker.html"
+    ]
+  }
+}

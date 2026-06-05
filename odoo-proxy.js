@@ -18,38 +18,13 @@ const ODOO_KEY  = "odoo_creds";     // stores JSON: { url, db, email, password }
 const ANTH_KEY  = "anthropic_key";  // stores raw API key string
 const CTX_KEY   = "user_context";   // stores freeform user context string
 
-// ── Credential storage: safeStorage+file in Electron, keytar in standalone ──
+// ── Credential storage: keytar (system keychain) in both standalone and Electron ──
 let keytar;
-if (process.versions.electron) {
-  const { safeStorage } = require("electron");
-  const credPath = path.join(require("electron").app.getPath("userData"), "creds.json");
-  const readStore = () => { try { return JSON.parse(fs.readFileSync(credPath, "utf8")); } catch { return {}; } };
-  const writeStore = (store) => fs.writeFileSync(credPath, JSON.stringify(store));
-  keytar = {
-    async getPassword(_svc, key) {
-      const store = readStore();
-      if (!store[key]) return null;
-      return safeStorage.decryptString(Buffer.from(store[key], "base64"));
-    },
-    async setPassword(_svc, key, value) {
-      const store = readStore();
-      store[key] = safeStorage.encryptString(value).toString("base64");
-      writeStore(store);
-    },
-    async deletePassword(_svc, key) {
-      const store = readStore();
-      delete store[key];
-      writeStore(store);
-      return true;
-    },
-  };
-} else {
-  try {
-    keytar = require("keytar");
-  } catch {
-    console.error("❌  keytar not found. Run: npm install keytar");
-    process.exit(1);
-  }
+try {
+  keytar = require("keytar");
+} catch {
+  console.error("❌  keytar not found. Run: npm install keytar");
+  process.exit(1);
 }
 
 // ── Read the HTML file (same directory as this script) ──
