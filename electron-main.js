@@ -5,21 +5,26 @@ const { execSync } = require("child_process");
 const SERVICE  = "odoo-time-tracker";
 const ACCOUNT  = "credentials";
 
+let credsCache = undefined;
+
 // Uses macOS `security` CLI to create keychain items with no app-specific ACL,
 // so the login keychain (auto-unlocked at login) grants access silently.
 function loadCreds() {
+  if (credsCache !== undefined) return credsCache;
   try {
     const b64 = execSync(
       `security find-generic-password -s "${SERVICE}" -a "${ACCOUNT}" -w`,
       { encoding: "utf8", stdio: ["pipe", "pipe", "ignore"] }
     ).trim();
-    return JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+    credsCache = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
   } catch {
-    return null;
+    credsCache = null;
   }
+  return credsCache;
 }
 
 function saveCreds(data) {
+  credsCache = data;
   const b64 = Buffer.from(JSON.stringify(data)).toString("base64");
   try {
     execSync(`security delete-generic-password -s "${SERVICE}" -a "${ACCOUNT}"`,
@@ -29,6 +34,7 @@ function saveCreds(data) {
 }
 
 function deleteCreds() {
+  credsCache = null;
   try {
     execSync(`security delete-generic-password -s "${SERVICE}" -a "${ACCOUNT}"`,
       { stdio: "ignore" });
