@@ -166,6 +166,68 @@ function ProjectSelect({ value, onChange, projects, recentProjectIds, style, pla
   );
 }
 
+function ProjectMultiSelect({ value, onChange, projects }) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) { setOpen(false); setSearch(""); } };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  const selectedSet = new Set(value);
+  const q = search.toLowerCase();
+  const filtered = q ? projects.filter(p => p.name.toLowerCase().includes(q)) : projects;
+
+  const toggle = (id) => {
+    const next = new Set(selectedSet);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    onChange([...next]);
+  };
+
+  const rowStyle = { padding:"6px 10px", fontSize:12, color:"var(--text)", cursor:"pointer", display:"flex", alignItems:"center", gap:8 };
+  const inp = { width:"100%", background:"var(--input-bg)", border:"1px solid var(--border)", borderRadius:7, padding:"9px 12px", color:"var(--text)", fontSize:13, outline:"none" };
+
+  return (
+    <div ref={ref} style={{ position:"relative" }}>
+      <div onClick={() => setOpen(o => !o)} style={{ ...inp, display:"flex", flexWrap:"wrap", gap:6, cursor:"pointer", minHeight:38, alignItems:"center" }}>
+        {value.length === 0 && <span style={{ color:"var(--text-lo)" }}>No projects selected — none will be shared with the AI</span>}
+        {value.map(id => {
+          const p = projects.find(pr => pr.id === id);
+          if (!p) return null;
+          return (
+            <span key={id} style={{ background:"var(--well)", border:"1px solid var(--border)", borderRadius:5, padding:"2px 8px", fontSize:12, display:"flex", alignItems:"center", gap:6 }}>
+              {p.name}
+              <span onClick={(e) => { e.stopPropagation(); toggle(id); }} style={{ color:"var(--text-lo)", cursor:"pointer" }}>✕</span>
+            </span>
+          );
+        })}
+      </div>
+      {open && (
+        <div style={{ position:"absolute", top:"calc(100% + 2px)", left:0, right:0, zIndex:1000, background:"var(--surface)", border:"1px solid var(--border)", borderRadius:8, boxShadow:"var(--shadow)", overflow:"hidden" }}>
+          <input autoFocus value={search} onChange={e => setSearch(e.target.value)}
+            onKeyDown={e => { if (e.key === "Escape") { setOpen(false); setSearch(""); } }}
+            placeholder="Search projects…"
+            style={{ width:"100%", background:"var(--well)", border:"none", borderBottom:"1px solid var(--border)", padding:"7px 10px", color:"var(--text)", fontSize:12, outline:"none" }} />
+          <div style={{ overflowY:"auto", maxHeight:220 }}>
+            {filtered.map(p => (
+              <div key={p.id} onClick={() => toggle(p.id)} style={rowStyle}
+                onMouseEnter={e => e.currentTarget.style.background="var(--well)"}
+                onMouseLeave={e => e.currentTarget.style.background="transparent"}>
+                <input type="checkbox" checked={selectedSet.has(p.id)} onChange={() => {}} style={{ pointerEvents:"none" }} />
+                {p.name}
+              </div>
+            ))}
+            {filtered.length === 0 && <div style={{ padding:"10px", fontSize:12, color:"var(--text-lo)", textAlign:"center" }}>No projects match</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 const BASE = "http://localhost:3010";
 
 async function odooRPC(method, args) {
@@ -277,6 +339,7 @@ function App() {
   const [userContext, setUserContext] = useState("");
   const [monthlyHours, setMonthlyHours] = useState(null);
   const [recentProjectIds, setRecentProjectIds] = useState(new Set());
+  const [aiAllowedProjectIds, setAiAllowedProjectIds] = useState(() => lsLoad("odoo-tracker-ai-allowed-projects") || []);
   const [showMonthsPopup, setShowMonthsPopup] = useState(false);
   const [monthsData, setMonthsData] = useState(null);
   const [monthsLoading, setMonthsLoading] = useState(false);
@@ -292,6 +355,8 @@ function App() {
     mq.addEventListener("change", handler);
     return () => mq.removeEventListener("change", handler);
   }, []);
+
+  useEffect(() => { lsSave("odoo-tracker-ai-allowed-projects", aiAllowedProjectIds); }, [aiAllowedProjectIds]);
 
   const darkMode = themeMode === "dark" || (themeMode === "system" && sysDark);
 
@@ -331,7 +396,7 @@ function App() {
   const [descPopup, setDescPopup] = useState(null);
   const [rowTooltip, setRowTooltip] = useState(null);
 
-  const [tableView, setTableView] = useState("day");
+  const [tableView, setTableView] = useState("week");
   const [tableDate, setTableDate] = useState(todayISO());
   const [tableEntries, setTableEntries] = useState([]);
   const [tableLoading, setTableLoading] = useState(false);
@@ -430,15 +495,47 @@ function App() {
   async function handleAIParse() {
     if (!aiInput.trim()) return;
     if (!anthropicKey) { setAiError("Add your Anthropic API key in Settings."); return; }
+    if (aiAllowedProjectIds.length === 0) { setAiError("Share at least one project with the AI in Settings first."); return; }
     setAiLoading(true); setAiError(""); setParsedEntries([]);
     try {
-      const projectList = projects.map(p => `${p.id}: ${p.name}`).join("\n") || "No projects loaded";
-      const taskList = tasks.map(t => `${t.id}: ${t.name} (project: ${t.project_id?.[1] || "none"})`).join("\n") || "No tasks loaded";
+      const allowedSet = new Set(aiAllowedProjectIds);
+      const allowedProjects = projects.filter(p => allowedSet.has(p.id));
+      const allowedTasks = tasks.filter(t => allowedSet.has(t.project_id?.[0]));
+      const projectList = allowedProjects.length
+        ? allowedProjects.map(p => `${p.id}: ${p.name}`).join("\n")
+        : "No projects shared — the user hasn't allowed any projects to be sent to the AI. Leave project_id/project_name null.";
+      const taskList = allowedProjects.length
+        ? (allowedTasks.map(t => `${t.id}: ${t.name} (project: ${t.project_id?.[1] || "none"})`).join("\n") || "No tasks in the allowed projects")
+        : "No tasks shared.";
       const body = JSON.stringify({
-        model: "claude-sonnet-4-20250514", max_tokens: 1000,
+        model: "claude-sonnet-5", max_tokens: 4096,
         messages: [{ role: "user", content:
-          `You are a timesheet assistant. Parse the work summary into time entries.\n\nAvailable Projects:\n${projectList}\n\nAvailable Tasks:\n${taskList}\n\n${userContext ? `User context (use this to map shorthand names/codes to the correct projects and tasks):\n${userContext}\n\n` : ""}Work summary: "${aiInput}"\n\nToday: ${new Date().toISOString().split("T")[0]}\n\nRespond ONLY with a JSON array (no markdown):\n- date: YYYY-MM-DD\n- project_id: number or null\n- project_name: string\n- task_id: number or null\n- task_name: string\n- hours: number\n- description: string`
-        }]
+          `You are a timesheet assistant. Parse the work summary into time entries.\n\nAvailable Projects:\n${projectList}\n\nAvailable Tasks:\n${taskList}\n\n${userContext ? `User context (use this to map shorthand names/codes to the correct projects and tasks):\n${userContext}\n\n` : ""}Work summary: "${aiInput}"\n\nToday: ${new Date().toISOString().split("T")[0]}\n\nFor each entry, provide: date (YYYY-MM-DD), project_id, project_name, task_id, task_name, hours, description.`
+        }],
+        output_config: { format: { type: "json_schema", schema: {
+          type: "object",
+          properties: {
+            entries: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  date: { type: "string" },
+                  project_id: { anyOf: [{ type: "integer" }, { type: "null" }] },
+                  project_name: { type: "string" },
+                  task_id: { anyOf: [{ type: "integer" }, { type: "null" }] },
+                  task_name: { type: "string" },
+                  hours: { type: "number" },
+                  description: { type: "string" }
+                },
+                required: ["date", "project_id", "project_name", "task_id", "task_name", "hours", "description"],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ["entries"],
+          additionalProperties: false
+        } } }
       });
       const headers = { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" };
       let data, attempts = 0;
@@ -454,7 +551,7 @@ function App() {
       }
       if (data.error) throw new Error(data.error.message);
       const text = data.content?.map(b => b.text || "").join("") || "";
-      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      const parsed = JSON.parse(text.trim()).entries;
       setParsedEntries(parsed.map((e, i) => ({ ...e, _id: i, _checked: true })));
     } catch (e) { setAiError("Parse failed: " + e.message); }
     setAiLoading(false);
@@ -804,12 +901,15 @@ function App() {
             {/* AI input */}
             <div style={{ marginBottom:32 }}>
               <p style={{ fontSize:13, color:"var(--text-mid)", marginBottom:10 }}>Describe your day naturally — AI extracts time entries automatically.</p>
-              <textarea value={aiInput} onChange={e => setAiInput(e.target.value)}
+              <textarea value={aiInput} onChange={e => setAiInput(e.target.value)} disabled={aiAllowedProjectIds.length === 0}
                 onKeyDown={e => { if (e.key === "Enter" && e.metaKey) handleAIParse(); }}
-                placeholder="e.g. Spent 2.5 hours on the Acme website redesign fixing the header. After lunch ~45 mins reviewing pull requests for the API project. Then 1 hour client call for Project Phoenix."
-                style={{ width:"100%", minHeight:110, background:"var(--raised)", border:"1px solid var(--border-mid)", borderRadius:8, padding:"12px 14px", color:"var(--text)", fontSize:13, resize:"vertical", outline:"none", lineHeight:1.6 }} />
+                placeholder={aiAllowedProjectIds.length === 0 ? "AI parsing is not configured — share at least one project in Settings to use it." : "e.g. Spent 2.5 hours on the Acme website redesign fixing the header. After lunch ~45 mins reviewing pull requests for the API project. Then 1 hour client call for Project Phoenix."}
+                style={{ width:"100%", minHeight:110, background:"var(--raised)", border:"1px solid var(--border-mid)", borderRadius:8, padding:"12px 14px", color:"var(--text)", fontSize:13, resize:"vertical", outline:"none", lineHeight:1.6, opacity: aiAllowedProjectIds.length === 0 ? 0.6 : 1, cursor: aiAllowedProjectIds.length === 0 ? "not-allowed" : "text" }} />
+              <p style={{ fontSize:12, color:"var(--text-lo)", marginTop:8 }}>
+                {aiAllowedProjectIds.length} project{aiAllowedProjectIds.length === 1 ? "" : "s"} shared with Claude. <span onClick={() => setTab("Settings")} style={{ color:"var(--accent)", cursor:"pointer" }}>Manage in Settings</span>
+              </p>
               <div style={{ display:"flex", gap:10, marginTop:10, alignItems:"center" }}>
-                <button onClick={handleAIParse} disabled={aiLoading || !aiInput.trim()} style={{ padding:"8px 18px", borderRadius:7, border:"none", cursor: aiLoading ? "wait" : "pointer", background:"var(--accent)", color:"#fff", fontWeight:600, fontSize:13, opacity: aiLoading ? 0.7 : 1 }}>
+                <button onClick={handleAIParse} disabled={aiLoading || !aiInput.trim() || aiAllowedProjectIds.length === 0} style={{ padding:"8px 18px", borderRadius:7, border:"none", cursor: aiLoading ? "wait" : "pointer", background:"var(--accent)", color:"#fff", fontWeight:600, fontSize:13, opacity: (aiLoading || aiAllowedProjectIds.length === 0) ? 0.5 : 1 }}>
                   {aiLoading ? "Parsing…" : "✨ Parse with AI"}{!aiLoading && <span style={{ marginLeft:8, fontSize:11, opacity:0.5 }}>⌘↵</span>}
                 </button>
                 {aiError && <span style={{ color:"var(--err-text)", fontSize:12 }}>{aiError}</span>}
@@ -1180,6 +1280,15 @@ function App() {
             <div style={{ marginBottom:14 }}>
               <label style={lbl}>API Key</label>
               <input type="password" value={sf.anthropicKey} onChange={e => setSf(p=>({...p,anthropicKey:e.target.value}))} placeholder="sk-ant-..." style={inp} />
+            </div>
+
+            <hr style={{ border:"none", borderTop:"1px solid var(--border)", margin:"28px 0" }} />
+            <h2 style={{ fontSize:15, fontWeight:700, color:"var(--text)", marginBottom:6 }}>AI Project Scope</h2>
+            <p style={{ fontSize:13, color:"var(--text-mid)", marginBottom:14 }}>
+              Only the projects (and their tasks) selected here are sent to the AI when parsing your work summary. Leave empty to share none.
+            </p>
+            <div style={{ marginBottom:24 }}>
+              <ProjectMultiSelect value={aiAllowedProjectIds} onChange={setAiAllowedProjectIds} projects={projects} />
             </div>
 
             <hr style={{ border:"none", borderTop:"1px solid var(--border)", margin:"28px 0" }} />
